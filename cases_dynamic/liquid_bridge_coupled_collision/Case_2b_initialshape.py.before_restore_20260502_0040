@@ -1,0 +1,799 @@
+"""Case 2b initial equilibrium shape for the Pitois 2000 Fig. 5 setup.
+
+This file exists only to build the static t=0 liquid-bridge shape before any
+separation motion starts.
+
+Design intent:
+1. Reuse the same volumetric bridge mesh family as the equilibrium benchmarks.
+2. Reuse the same volumetric stress operator path used by Case 2b separation.
+3. Keep the two sphere-wetted cap patches fixed on the particle surfaces.
+4. Relax only the free liquid surface.
+5. Include the same hydrostatic pressure contribution used in the Fig. 5
+   separation setup.
+6. Apply a final scalar-pressure correction so the total discrete force on the
+   liquid bridge plus sphere reactions closes to machine precision.
+
+Important note:
+The bridge profile is still initialized from the same axisymmetric geometric
+guess used by the separation file, but this script then performs a dedicated
+static relaxation and force-balance correction on that initial state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/ddgclib-mpl")
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from ddgclib.dynamic_integrators import symplectic_euler
+from ddgclib.operators.multiphase_stress import multiphase_stress_force
+
+from cases_dynamic.liquid_bridge_coupled_collision import Case_2b_pitois2000_separation as sep
+from cases_dynamic.liquid_bridge_coupled_collision.case_2b_axisym import (
+    Case_2b_axisym_initialshape as hyperct_axisym_initialshape,
+)
+
+
+OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_initialshape"
+
+# ---------------------------------------------------------------------------
+# USER CONTROLS
+# ---------------------------------------------------------------------------
+USER_CONTACT_LINE_NODES = 8
+# Exact number of radial rings used near the contact line.
+USER_CONTACT_LINE_RADIAL_RINGS = 3
+# Additional outer-band rings near the contact line.
+USER_EXTRA_CL_RADIAL_RINGS = 4
+# Extra axial rings inserted next to the two contact lines.
+USER_CL_EXTRA_AXIAL_LAYERS = 4
+# 1 keeps all sidewall axial rings. 2 keeps every other axial ring, etc.
+USER_SIDEWALL_AXIAL_RING_STRIDE = 1
+# 1.0 = equal radial spacing in the outer CL band. Values above 1.0 make the
+# mesh slightly finer right next to the contact line.
+USER_CL_RADIAL_BIAS_RATIO = 1.4
+USER_RELAX_DT_S = 2.0e-5
+USER_TOTAL_ITERATIONS = 100
+USER_RELAX_DAMPING = 20.0
+USER_FORCE_TOL_N = 1.0e-10
+USER_TOTAL_FORCE_TOL_N = 1.0e-14
+USER_SPEED_TOL_MPS = 1.0e-9
+# The separation module default is 0.44, which gives a visibly pinched
+# Case-2b initial bridge. This HyperCT initial-shape case starts from the
+# smoother Case-2b axisymmetric profile instead.
+USER_INITIAL_NECK_RADIUS_RATIO = 0.6424
+USER_ACCEL_WORKERS = 1
+USER_FORCE_METRIC_WORKERS = USER_ACCEL_WORKERS
+USER_STEP_MAX_RETRIES = 3
+USER_STEP_RETRY_DT_SCALE = 0.5
+USER_HISTORY_EVERY = 10
+# Expensive global correction; the final correction still always runs.
+USER_PRESSURE_BALANCE_EVERY = USER_TOTAL_ITERATIONS
+USER_LOG_EVERY = USER_HISTORY_EVERY
+USER_MESH_SNAPSHOT_EVERY_ITERATIONS = 10
+# Build the t=0 geometry with the HyperCT Young-Laplace/volume matcher before
+# relaxation. This keeps the .msh tetrahedral water volume equal to Case 2b's
+# prescribed 1.10 uL without using the Gmsh path.
+USER_MATCH_INITIAL_MSH_VOLUME = True
+USER_VOLUME_MATCH_REL_TOL = 1.0e-6
+USER_VOLUME_CORRECTION_EVERY = USER_MESH_SNAPSHOT_EVERY_ITERATIONS
+# Fast path: avoid the old radial target-volume rescale entirely. Enable the
+# continuity pressure only when stricter volume control is worth the extra
+# force evaluations.
+USER_ENABLE_CONTINUITY_PRESSURE = False
+USER_UNPIN_CONTACT_LINE = False
+USER_CONTACT_ANGLE_DEG = 0.0
+USER_RENDER_INITIAL_GUESS = True
+USER_RENDER_FINAL_STATE = True
+USER_OPEN_INTERACTIVE_WINDOW = False
+USER_INTERACTIVE_STEP = USER_TOTAL_ITERATIONS
+
+
+def _separation_view_kwargs() -> dict[str, float]:
+    """Always reuse the current separation-camera settings for initial-shape views."""
+    return {
+        "elev": float(sep.USER_INTERACTIVE_ELEV_DEG),
+        "azim": float(sep.USER_INTERACTIVE_AZIM_DEG),
+    }
+
+
+def _refinement_from_contact_line_nodes(n_nodes: int) -> int:
+    n_nodes = int(n_nodes)
+    if n_nodes < 4:
+        raise ValueError("USER_CONTACT_LINE_NODES must be at least 4.")
+    ratio = n_nodes / 4.0
+    log2_ratio = np.log2(ratio)
+    refinement = int(round(log2_ratio))
+    if abs(log2_ratio - refinement) > 1.0e-12:
+        raise ValueError("USER_CONTACT_LINE_NODES must be 4, 8, 16, 32, ... for the current mesh builder.")
+    return refinement
+
+
+def initialshape_config() -> sep.VolumetricPitoisConfig:
+    return replace(
+        sep.separation_config(),
+        name="Case_2b_initialshape",
+        title="Case 2b: equilibrium initial shape",
+        use_last_initialshape_msh=False,
+        refinement=_refinement_from_contact_line_nodes(USER_CONTACT_LINE_NODES),
+        contact_line_radial_rings=int(USER_CONTACT_LINE_RADIAL_RINGS),
+        extra_cl_radial_rings=int(USER_EXTRA_CL_RADIAL_RINGS),
+        cl_extra_axial_layers=int(USER_CL_EXTRA_AXIAL_LAYERS),
+        axial_ring_stride=int(USER_SIDEWALL_AXIAL_RING_STRIDE),
+        contact_line_radial_bias_ratio=float(USER_CL_RADIAL_BIAS_RATIO),
+        cap_speed=0.0,
+        dt=USER_RELAX_DT_S,
+        n_steps=0,
+        damping=USER_RELAX_DAMPING,
+        integration_substeps=1,
+        enable_initial_relaxation=False,
+        enable_continuity_pressure=USER_ENABLE_CONTINUITY_PRESSURE,
+        initial_neck_radius_ratio=float(USER_INITIAL_NECK_RADIUS_RATIO),
+        allow_contact_line_growth=USER_UNPIN_CONTACT_LINE,
+        contact_angle_deg=USER_CONTACT_ANGLE_DEG,
+        record_every=1,
+        mesh_snapshot_every=1,
+    )
+
+
+def _static_vertex_force(v, *, state: sep.VolumetricPitoisState) -> np.ndarray:
+    return multiphase_stress_force(
+        v,
+        dim=3,
+        mps=state.mps,
+        HC=state.HC,
+        pressure_model=lambda vv, HC=None, dim=3: sep._pressure_model(vv, HC=HC, dim=dim, state=state),
+    )
+
+
+def _free_force_metrics(state: sep.VolumetricPitoisState) -> dict[str, np.ndarray | float]:
+    free_vertices = [v for v in state.HC.V if v not in state.bV_caps]
+    workers = max(1, int(USER_FORCE_METRIC_WORKERS))
+    if workers > 1 and len(free_vertices) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            free_forces = list(pool.map(lambda v: _static_vertex_force(v, state=state), free_vertices))
+    else:
+        free_forces = [_static_vertex_force(v, state=state) for v in free_vertices]
+    if free_forces:
+        free_arr = np.asarray(free_forces, dtype=float)
+    else:
+        free_arr = np.zeros((0, 3), dtype=float)
+
+    sphere_forces = sep._sphere_total_forces(state)
+    free_total = np.sum(free_arr, axis=0) if free_arr.size else np.zeros(3, dtype=float)
+    sphere_total = sphere_forces["top_total"] + sphere_forces["bottom_total"]
+    net_total = free_total + sphere_total
+
+    return {
+        "free_total": free_total,
+        "sphere_total": sphere_total,
+        "net_total": net_total,
+        "max_free_force_norm": float(np.max(np.linalg.norm(free_arr, axis=1))) if free_arr.size else 0.0,
+        "rms_free_force_norm": float(np.sqrt(np.mean(np.sum(free_arr * free_arr, axis=1)))) if free_arr.size else 0.0,
+        "top_total": np.asarray(sphere_forces["top_total"], dtype=float),
+        "bottom_total": np.asarray(sphere_forces["bottom_total"], dtype=float),
+        "top_cap": np.asarray(sphere_forces["top_cap"], dtype=float),
+        "bottom_cap": np.asarray(sphere_forces["bottom_cap"], dtype=float),
+        "top_line": np.asarray(sphere_forces["top_line"], dtype=float),
+        "bottom_line": np.asarray(sphere_forces["bottom_line"], dtype=float),
+    }
+
+
+def _solve_total_force_balance_pressure(
+    state: sep.VolumetricPitoisState,
+    *,
+    tol: float = 1.0e-15,
+    max_iters: int = 2,
+) -> float:
+    """Adjust the scalar pressure offset so the net axial force closes to zero."""
+
+    pressure_scale = max(
+        1.0,
+        abs(float(state.pressure_scalar)),
+        float(state.config.gamma) / max(float(state.config.target_cap_radius), 1.0e-30),
+    )
+    delta_p = max(1.0e-6 * pressure_scale, 1.0e-6)
+
+    p = float(state.pressure_scalar)
+    for _ in range(max_iters):
+        state.pressure_scalar = p
+        f0 = float(_free_force_metrics(state)["net_total"][2])
+        if abs(f0) <= tol:
+            break
+
+        state.pressure_scalar = p + delta_p
+        f1 = float(_free_force_metrics(state)["net_total"][2])
+        slope = (f1 - f0) / delta_p
+        if not np.isfinite(slope) or abs(slope) <= 1.0e-30:
+            state.pressure_scalar = p
+            break
+        p = p - f0 / slope
+
+    state.pressure_scalar = p
+    return p
+
+
+def _history_row_from_metrics(
+    state: sep.VolumetricPitoisState,
+    *,
+    step: int,
+    metrics: dict,
+    time_s: float | None = None,
+) -> dict[str, float | int]:
+    return {
+        "step": int(step),
+        "time_s": float(step * state.config.dt if time_s is None else time_s),
+        "gap_um": float(sep._gap(state) * 1.0e6),
+        "pressure_scalar_pa": float(state.pressure_scalar),
+        "max_free_force_norm_n": float(metrics["max_free_force_norm"]),
+        "rms_free_force_norm_n": float(metrics["rms_free_force_norm"]),
+        "max_free_speed_mps": float(sep._max_free_speed(state)),
+        "net_total_force": np.asarray(metrics["net_total"], dtype=float).tolist(),
+        "net_total_force_norm_n": float(np.linalg.norm(metrics["net_total"])),
+        "free_total_force": np.asarray(metrics["free_total"], dtype=float).tolist(),
+        "sphere_total_force": np.asarray(metrics["sphere_total"], dtype=float).tolist(),
+        "top_sphere_force": np.asarray(metrics["top_total"], dtype=float).tolist(),
+        "bottom_sphere_force": np.asarray(metrics["bottom_total"], dtype=float).tolist(),
+    }
+
+
+def _history_row(state: sep.VolumetricPitoisState, *, step: int, time_s: float | None = None) -> dict[str, float | int]:
+    return _history_row_from_metrics(
+        state,
+        step=step,
+        time_s=time_s,
+        metrics=_free_force_metrics(state),
+    )
+
+
+def _capture_state_snapshot(state: sep.VolumetricPitoisState) -> dict:
+    vertices = list(state.HC.V)
+    return {
+        "vertices": vertices,
+        "positions": [tuple(np.asarray(v.x_a[:3], dtype=float)) for v in vertices],
+        "velocities": [np.asarray(v.u[:3], dtype=float).copy() for v in vertices],
+        "bottom_sphere_center": np.asarray(state.bottom_sphere_center, dtype=float).copy(),
+        "top_sphere_center": np.asarray(state.top_sphere_center, dtype=float).copy(),
+        "pressure_scalar": float(state.pressure_scalar),
+    }
+
+
+def _restore_state_snapshot(state: sep.VolumetricPitoisState, snapshot: dict) -> None:
+    sep._move_vertices_batch(snapshot["vertices"], snapshot["positions"], state.HC, state.bV_caps)
+    for v, u in zip(snapshot["vertices"], snapshot["velocities"]):
+        v.u = np.asarray(u, dtype=float).copy()
+    state.bottom_sphere_center = np.asarray(snapshot["bottom_sphere_center"], dtype=float).copy()
+    state.top_sphere_center = np.asarray(snapshot["top_sphere_center"], dtype=float).copy()
+    state.pressure_scalar = float(snapshot["pressure_scalar"])
+
+
+def _first_nonfinite_state_issue(state: sep.VolumetricPitoisState) -> str | None:
+    for v in state.HC.V:
+        pos = np.asarray(v.x_a[:3], dtype=float)
+        if not np.all(np.isfinite(pos)):
+            return f"non-finite vertex position at {tuple(pos.tolist())}"
+        vel = np.asarray(v.u[:3], dtype=float)
+        if not np.all(np.isfinite(vel)):
+            return f"non-finite vertex velocity at {tuple(vel.tolist())}"
+    if not np.all(np.isfinite(np.asarray(state.bottom_sphere_center, dtype=float))):
+        return "non-finite bottom_sphere_center"
+    if not np.all(np.isfinite(np.asarray(state.top_sphere_center, dtype=float))):
+        return "non-finite top_sphere_center"
+    if not np.isfinite(float(state.pressure_scalar)):
+        return "non-finite pressure_scalar"
+    return None
+
+
+def _set_target_msh_volume_metadata(state: sep.VolumetricPitoisState) -> float:
+    target = float(state.config.initial_bridge_volume_m3)
+    state.target_snapshot_volume_m3 = target
+    state.target_volume_m3 = target
+    return float(sep._snapshot_msh_volume_m3(state))
+
+
+def _match_initial_hyperct_msh_volume(state: sep.VolumetricPitoisState) -> float:
+    target = float(state.config.initial_bridge_volume_m3)
+    if not bool(USER_MATCH_INITIAL_MSH_VOLUME):
+        return _set_target_msh_volume_metadata(state)
+
+    ok = bool(hyperct_axisym_initialshape._build_young_laplace_bvp_initial_guess(state))
+    if not ok:
+        raise RuntimeError("HyperCT Young-Laplace initial volume solve failed for Case 2b.")
+
+    current = _set_target_msh_volume_metadata(state)
+    rel_error = abs(current - target) / max(target, 1.0e-30)
+    if rel_error > float(USER_VOLUME_MATCH_REL_TOL):
+        raise RuntimeError(
+            "HyperCT initial .msh volume mismatch: "
+            f"target={1.0e9 * target:.9f} uL, current={1.0e9 * current:.9f} uL"
+        )
+    return current
+
+
+def _correct_current_hyperct_msh_volume(state: sep.VolumetricPitoisState) -> float:
+    target = float(state.config.initial_bridge_volume_m3)
+    state.target_snapshot_volume_m3 = target
+    state.target_volume_m3 = target
+    if not bool(USER_MATCH_INITIAL_MSH_VOLUME):
+        return float(sep._snapshot_msh_volume_m3(state))
+    return float(
+        hyperct_axisym_initialshape._enforce_target_msh_volume(
+            state,
+            rel_tol=float(USER_VOLUME_MATCH_REL_TOL),
+            max_iters=32,
+        )
+    )
+
+
+def _write_json(path: Path, payload) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def _render_equilibrium_history_figures(history: list[dict], out_dir: Path, *, dt: float) -> list[Path]:
+    if not history:
+        return []
+
+    fig_dir = out_dir / "fig"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    steps = np.array([int(row["step"]) for row in history], dtype=float)
+    time_ms = np.array(
+        [1.0e3 * float(row.get("time_s", float(step) * float(dt))) for step, row in zip(steps, history)],
+        dtype=float,
+    )
+    max_free_force = np.array([float(row["max_free_force_norm_n"]) for row in history], dtype=float)
+    total_force = np.array([float(row["net_total_force_norm_n"]) for row in history], dtype=float)
+    max_free_speed = np.array([float(row["max_free_speed_mps"]) for row in history], dtype=float)
+
+    paths: list[Path] = []
+
+    fig1, ax1 = plt.subplots(figsize=(7.0, 4.6))
+    ax1.plot(time_ms, max_free_force, color="#bc4749", linewidth=1.8, marker="o", markersize=3.8)
+    ax1.set_yscale("log")
+    ax1.set_xlabel("Time [ms]")
+    ax1.set_ylabel("Max free-force norm [N]")
+    ax1.set_title("Equilibrium relaxation: local force residual")
+    ax1.grid(alpha=0.28, which="both")
+    path1 = fig_dir / "equilibrium_max_free_force_vs_t.png"
+    fig1.tight_layout()
+    fig1.savefig(path1, dpi=180, bbox_inches="tight")
+    plt.close(fig1)
+    paths.append(path1)
+
+    fig2, ax2 = plt.subplots(figsize=(7.0, 4.6))
+    ax2.plot(time_ms, total_force, color="#2a6f97", linewidth=1.8, marker="o", markersize=3.8)
+    ax2.set_yscale("log")
+    ax2.set_xlabel("Time [ms]")
+    ax2.set_ylabel("Total force norm [N]")
+    ax2.set_title("Equilibrium relaxation: global force residual")
+    ax2.grid(alpha=0.28, which="both")
+    path2 = fig_dir / "equilibrium_total_force_vs_t.png"
+    fig2.tight_layout()
+    fig2.savefig(path2, dpi=180, bbox_inches="tight")
+    plt.close(fig2)
+    paths.append(path2)
+
+    fig3, ax3 = plt.subplots(figsize=(7.0, 4.6))
+    ax3.plot(time_ms, max_free_speed, color="#6a4c93", linewidth=1.8, marker="o", markersize=3.8)
+    ax3.set_yscale("log")
+    ax3.set_xlabel("Time [ms]")
+    ax3.set_ylabel("Max free speed [m/s]")
+    ax3.set_title("Equilibrium relaxation: speed residual")
+    ax3.grid(alpha=0.28, which="both")
+    path3 = fig_dir / "equilibrium_max_free_speed_vs_t.png"
+    fig3.tight_layout()
+    fig3.savefig(path3, dpi=180, bbox_inches="tight")
+    plt.close(fig3)
+    paths.append(path3)
+
+    fig4, axes = plt.subplots(3, 1, figsize=(7.2, 8.4), sharex=True)
+    axes[0].plot(time_ms, max_free_force, color="#bc4749", linewidth=1.8, marker="o", markersize=3.2)
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("Max free-force [N]")
+    axes[0].grid(alpha=0.28, which="both")
+    axes[0].set_title("Equilibrium relaxation residuals vs time")
+
+    axes[1].plot(time_ms, total_force, color="#2a6f97", linewidth=1.8, marker="o", markersize=3.2)
+    axes[1].set_yscale("log")
+    axes[1].set_ylabel("Total force [N]")
+    axes[1].grid(alpha=0.28, which="both")
+
+    axes[2].plot(time_ms, max_free_speed, color="#6a4c93", linewidth=1.8, marker="o", markersize=3.2)
+    axes[2].set_yscale("log")
+    axes[2].set_ylabel("Max free speed [m/s]")
+    axes[2].set_xlabel("Time [ms]")
+    axes[2].grid(alpha=0.28, which="both")
+
+    path4 = fig_dir / "equilibrium_residuals_vs_t.png"
+    fig4.tight_layout()
+    fig4.savefig(path4, dpi=180, bbox_inches="tight")
+    plt.close(fig4)
+    paths.append(path4)
+
+    return paths
+
+
+def _save_relaxation_snapshot(
+    state: sep.VolumetricPitoisState,
+    *,
+    step: int,
+    fig_dir: Path,
+) -> Path:
+    return sep._render_mesh_snapshot(
+        state,
+        f"{state.config.title}: iteration {step} mesh",
+        fig_dir / f"mesh_iter{step:04d}.png",
+        **_separation_view_kwargs(),
+    )
+
+
+def _show_interactive_snapshot(
+    state: sep.VolumetricPitoisState,
+    *,
+    step: int,
+) -> None:
+    sep._show_state_interactive(
+        state,
+        step=int(step),
+        **_separation_view_kwargs(),
+    )
+
+
+def _summary_payload(
+    state: sep.VolumetricPitoisState,
+    *,
+    initial_metrics: dict,
+    final_metrics: dict,
+    history: list[dict],
+) -> dict:
+    snapshot_volume = float(sep._snapshot_msh_volume_m3(state))
+    target_volume = float(state.config.initial_bridge_volume_m3)
+    dual_cell_sum = float(sep._mesh_volume_m3(state.HC))
+    weight = np.array([0.0, 0.0, -float(state.config.rho_f) * snapshot_volume * float(state.config.gravity_mps2)], dtype=float)
+    return {
+        "config": {
+            "refinement": int(state.config.refinement),
+            "particle_radius_mm": float(state.config.particle_radius * 1.0e3),
+            "target_cap_radius_mm": float(state.config.target_cap_radius * 1.0e3),
+            "initial_gap_um": float(sep._gap(state) * 1.0e6),
+            "target_volume_ul": float(target_volume * 1.0e9),
+            "volume_ul": float(snapshot_volume * 1.0e9),
+            "volume_rel_error": float((snapshot_volume - target_volume) / max(target_volume, 1.0e-30)),
+            "dual_cell_sum_ul": float(dual_cell_sum * 1.0e9),
+            "gamma_npm": float(state.config.gamma),
+            "mu_pas": float(state.config.mu_f),
+            "rho_f": float(state.config.rho_f),
+            "gravity_mps2": float(state.config.gravity_mps2),
+        },
+        "initial_metrics": {
+            **{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in initial_metrics.items()},
+        },
+        "final_metrics": {
+            **{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in final_metrics.items()},
+            "weight_force": weight.tolist(),
+        },
+        "history": history,
+    }
+
+
+def _relax_initial_shape(
+    state: sep.VolumetricPitoisState,
+    *,
+    max_steps: int,
+    force_tol: float,
+    total_force_tol: float,
+    speed_tol: float,
+    fig_dir: Path,
+    initial_metrics: dict | None = None,
+) -> list[dict]:
+    history: list[dict] = []
+    run_wall_start = time.perf_counter()
+    interactive_shown = False
+    sim_time_s = 0.0
+    working_dt = float(state.config.dt)
+    history_every = max(1, int(USER_HISTORY_EVERY))
+    pressure_balance_every = max(1, int(USER_PRESSURE_BALANCE_EVERY))
+    log_every = max(1, int(USER_LOG_EVERY))
+    snapshot_every = max(1, int(USER_MESH_SNAPSHOT_EVERY_ITERATIONS))
+
+    for v in state.HC.V:
+        v.u = np.zeros(3, dtype=float)
+
+    if initial_metrics is None:
+        sep._update_duals_and_masses(state)
+        sep._update_pressure_scalar(state)
+        sep._update_continuity_pressure_scalar(state, dt=working_dt)
+        if USER_UNPIN_CONTACT_LINE:
+            sep._update_moving_contact_line(state, dt=None)
+            _set_target_msh_volume_metadata(state)
+            sep._update_duals_and_masses(state)
+            sep._update_pressure_scalar(state)
+            sep._update_continuity_pressure_scalar(state, dt=working_dt)
+        else:
+            _set_target_msh_volume_metadata(state)
+        _solve_total_force_balance_pressure(state)
+        initial_metrics = _free_force_metrics(state)
+    row0 = _history_row_from_metrics(state, step=0, time_s=sim_time_s, metrics=initial_metrics)
+    history.append(row0)
+    print(
+        f"[equilibrium] step 0/{max_steps}: "
+        f"step_wall=0.000000 s, elapsed=0.000000 s, "
+        f"max_free_force={row0['max_free_force_norm_n']:.6e} N, "
+        f"net_total={row0['net_total_force_norm_n']:.6e} N, "
+        f"max_free_speed={row0['max_free_speed_mps']:.6e} m/s",
+        flush=True,
+    )
+    if USER_OPEN_INTERACTIVE_WINDOW and int(USER_INTERACTIVE_STEP) == 0:
+        _show_interactive_snapshot(state, step=0)
+        interactive_shown = True
+
+    for step in range(1, max_steps + 1):
+        step_wall_start = time.perf_counter()
+        snapshot = _capture_state_snapshot(state)
+        dt_step = working_dt
+        issue = None
+        for attempt in range(max(1, int(USER_STEP_MAX_RETRIES)) + 1):
+            if attempt > 0:
+                _restore_state_snapshot(state, snapshot)
+                for v in state.HC.V:
+                    v.u = np.zeros(3, dtype=float)
+                dt_step *= float(USER_STEP_RETRY_DT_SCALE)
+                print(
+                    f"[equilibrium] step {step}/{max_steps}: retry {attempt} with dt={dt_step:.3e} s",
+                    flush=True,
+                )
+
+            sep._update_duals_and_masses(state)
+            sep._update_pressure_scalar(state)
+            sep._update_continuity_pressure_scalar(state, dt=dt_step)
+            symplectic_euler(
+                state.HC,
+                state.bV_caps,
+                sep._vertex_acceleration,
+                dt=dt_step,
+                n_steps=1,
+                dim=3,
+                retopologize_fn=False,
+                workers=max(1, int(USER_ACCEL_WORKERS)),
+                state=state,
+            )
+            issue = _first_nonfinite_state_issue(state)
+            if issue is None:
+                if USER_UNPIN_CONTACT_LINE:
+                    sep._update_moving_contact_line(state, dt=None)
+                    _set_target_msh_volume_metadata(state)
+                else:
+                    sep._axisymmetrize_layer_rings(state)
+                    sep._regularize_layer_order(state)
+                    _set_target_msh_volume_metadata(state)
+                issue = _first_nonfinite_state_issue(state)
+            if issue is None:
+                break
+
+        if issue is not None:
+            _restore_state_snapshot(state, snapshot)
+            for v in state.HC.V:
+                v.u = np.zeros(3, dtype=float)
+            print(
+                f"[equilibrium] step {step}/{max_steps}: stopped on last valid state after {issue}",
+                flush=True,
+            )
+            break
+
+        working_dt = dt_step
+        sim_time_s += dt_step
+        history_due = step % history_every == 0 or step == max_steps
+        pressure_balance_due = step % pressure_balance_every == 0 or step == max_steps
+        volume_correction_due = step % max(1, int(USER_VOLUME_CORRECTION_EVERY)) == 0 or step == max_steps
+        if volume_correction_due:
+            _correct_current_hyperct_msh_volume(state)
+        if history_due or pressure_balance_due:
+            sep._update_duals_and_masses(state)
+            sep._update_pressure_scalar(state)
+            sep._update_continuity_pressure_scalar(state, dt=dt_step)
+        if pressure_balance_due:
+            _solve_total_force_balance_pressure(state)
+        row = _history_row(state, step=step, time_s=sim_time_s) if history_due else None
+        step_wall = time.perf_counter() - step_wall_start
+        elapsed = time.perf_counter() - run_wall_start
+
+        if row is not None:
+            print(
+                f"[equilibrium] step {step}/{max_steps}: "
+                f"step_wall={step_wall:.6f} s, elapsed={elapsed:.6f} s, "
+                f"dt={dt_step:.3e} s, "
+                f"max_free_force={row['max_free_force_norm_n']:.6e} N, "
+                f"net_total={row['net_total_force_norm_n']:.6e} N, "
+                f"max_free_speed={row['max_free_speed_mps']:.6e} m/s",
+                flush=True,
+            )
+        elif step == 1 or step % log_every == 0:
+            print(
+                f"[equilibrium] step {step}/{max_steps}: "
+                f"step_wall={step_wall:.6f} s, elapsed={elapsed:.6f} s, "
+                f"dt={dt_step:.3e} s",
+                flush=True,
+            )
+
+        if step % snapshot_every == 0:
+            _save_relaxation_snapshot(state, step=step, fig_dir=fig_dir)
+        if USER_OPEN_INTERACTIVE_WINDOW and not interactive_shown and int(USER_INTERACTIVE_STEP) == step:
+            _show_interactive_snapshot(state, step=step)
+            interactive_shown = True
+
+        if row is not None:
+            history.append(row)
+            if (
+                float(row["max_free_force_norm_n"]) <= force_tol
+                and float(row["net_total_force_norm_n"]) <= total_force_tol
+                and float(row["max_free_speed_mps"]) <= speed_tol
+            ):
+                break
+
+    for v in state.HC.V:
+        v.u = np.zeros(3, dtype=float)
+    _correct_current_hyperct_msh_volume(state)
+    sep._update_duals_and_masses(state)
+    sep._update_pressure_scalar(state)
+    sep._update_continuity_pressure_scalar(state, dt=working_dt)
+    _solve_total_force_balance_pressure(state)
+    final_row = _history_row(state, step=int(history[-1]["step"]) if history else 0, time_s=sim_time_s)
+    if history and int(history[-1]["step"]) == int(final_row["step"]) and abs(float(history[-1]["time_s"]) - float(final_row["time_s"])) <= 1.0e-30:
+        history[-1] = final_row
+    else:
+        history.append(final_row)
+    print(
+        f"[equilibrium] final correction: "
+        f"elapsed={time.perf_counter() - run_wall_start:.6f} s, "
+        f"max_free_force={final_row['max_free_force_norm_n']:.6e} N, "
+        f"net_total={final_row['net_total_force_norm_n']:.6e} N, "
+        f"max_free_speed={final_row['max_free_speed_mps']:.6e} m/s",
+        flush=True,
+    )
+    if USER_OPEN_INTERACTIVE_WINDOW and not interactive_shown and int(USER_INTERACTIVE_STEP) == int(final_row["step"]):
+        _show_interactive_snapshot(state, step=int(final_row["step"]))
+    return history
+
+
+def main() -> None:
+    config = initialshape_config()
+    state = sep._prepare_state(config)
+
+    out_dir = OUT_ROOT
+    fig_dir = out_dir / "fig"
+    result_dir = out_dir / "results"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    for v in state.HC.V:
+        v.u = np.zeros(3, dtype=float)
+    initial_snapshot_volume = _match_initial_hyperct_msh_volume(state)
+    print(
+        "[initial volume] "
+        f"target={1.0e9 * float(config.initial_bridge_volume_m3):.9f} uL, "
+        f"current={1.0e9 * initial_snapshot_volume:.9f} uL",
+        flush=True,
+    )
+    sep._update_duals_and_masses(state)
+    sep._update_pressure_scalar(state)
+    sep._update_continuity_pressure_scalar(state, dt=float(state.config.dt))
+    if USER_UNPIN_CONTACT_LINE:
+        sep._update_moving_contact_line(state, dt=None)
+        _set_target_msh_volume_metadata(state)
+        sep._update_duals_and_masses(state)
+        sep._update_pressure_scalar(state)
+        sep._update_continuity_pressure_scalar(state, dt=float(state.config.dt))
+    _solve_total_force_balance_pressure(state)
+    initial_metrics = _free_force_metrics(state)
+    print(
+        "[initial guess] "
+        f"max_free_force={float(initial_metrics['max_free_force_norm']):.6e} N, "
+        f"net_total={float(np.linalg.norm(initial_metrics['net_total'])):.6e} N",
+        flush=True,
+    )
+
+    if USER_RENDER_INITIAL_GUESS:
+        sep._render_mesh_snapshot(
+            state,
+            f"{config.title}: raw initial guess",
+            fig_dir / "mesh_initial_guess.png",
+            **_separation_view_kwargs(),
+        )
+
+    history = _relax_initial_shape(
+        state,
+        max_steps=USER_TOTAL_ITERATIONS,
+        force_tol=USER_FORCE_TOL_N,
+        total_force_tol=USER_TOTAL_FORCE_TOL_N,
+        speed_tol=USER_SPEED_TOL_MPS,
+        fig_dir=fig_dir,
+        initial_metrics=initial_metrics,
+    )
+    final_metrics = _free_force_metrics(state)
+
+    if USER_RENDER_FINAL_STATE:
+        sep._render_mesh_snapshot(
+            state,
+            f"{config.title}: equilibrium initial mesh",
+            fig_dir / "mesh_initial.png",
+            **_separation_view_kwargs(),
+        )
+
+    _write_json(result_dir / "equilibrium_history.json", history)
+    _write_json(
+        result_dir / "equilibrium_summary.json",
+        _summary_payload(
+            state,
+            initial_metrics=initial_metrics,
+            final_metrics=final_metrics,
+            history=history,
+        ),
+    )
+    history_fig_paths = _render_equilibrium_history_figures(history, out_dir, dt=float(config.dt))
+
+    final_row = history[-1]
+    total_cl_rings = int(config.contact_line_radial_rings) + int(config.extra_cl_radial_rings)
+    print("=" * 72)
+    print("  Case 2b initial equilibrium shape")
+    print("=" * 72)
+    print(f"Refinement                = {config.refinement}")
+    print(f"Contact-line nodes        = {len(state.outer_rings[0])}")
+    print(f"CL radial rings           = {config.contact_line_radial_rings}")
+    print(f"Extra CL outer rings      = {config.extra_cl_radial_rings}")
+    print(f"CL radial bias ratio      = {config.contact_line_radial_bias_ratio}")
+    print(f"Sidewall axial stride     = {config.axial_ring_stride}")
+    print(f"Sidewall axial layers     = {len(state.outer_rings)}")
+    if total_cl_rings <= 1 and abs(float(config.contact_line_radial_bias_ratio) - 1.0) > 1.0e-12:
+        print("CL radial bias active?    = no (need at least 2 total CL rings)")
+    print(f"Contact line              = {'unpinned' if USER_UNPIN_CONTACT_LINE else 'pinned'}")
+    print(f"Contact angle             = {config.contact_angle_deg:.3f} deg")
+    print(f"Particle radius           = {config.particle_radius * 1.0e3:.3f} mm")
+    print(f"Bridge contact radius     = {config.target_cap_radius * 1.0e3:.3f} mm")
+    print(f"Surface tension           = {config.gamma:.4f} N/m")
+    print(f"Viscosity                 = {config.mu_f:.3e} Pa s")
+    print(f"Density                   = {config.rho_f:.3f} kg/m^3")
+    print(f"Gravity acceleration      = {config.gravity_mps2:.3f} m/s^2")
+    print(f"Relax dt                  = {config.dt:.3e} s")
+    print(f"Total iterations          = {USER_TOTAL_ITERATIONS}")
+    print(f"Acceleration workers      = {USER_ACCEL_WORKERS}")
+    print(f"Mesh snapshot every       = {USER_MESH_SNAPSHOT_EVERY_ITERATIONS}")
+    final_snapshot_volume = float(sep._snapshot_msh_volume_m3(state))
+    target_snapshot_volume = float(config.initial_bridge_volume_m3)
+    print(f"Target bridge volume      = {1.0e9 * target_snapshot_volume:.9f} uL")
+    print(f"Final .msh volume         = {1.0e9 * final_snapshot_volume:.9f} uL")
+    print(
+        f"Final volume rel. error   = "
+        f"{(final_snapshot_volume - target_snapshot_volume) / max(target_snapshot_volume, 1.0e-30):+.6e}"
+    )
+    print(f"Final pressure scalar     = {state.pressure_scalar:.12e} Pa")
+    print(f"Final gap                 = {sep._gap(state) * 1.0e6:.6f} um")
+    print(f"Final max free-force norm = {float(final_row['max_free_force_norm_n']):.12e} N")
+    print(f"Final total-force norm    = {float(final_row['net_total_force_norm_n']):.12e} N")
+    print(f"Final max free speed      = {float(final_row['max_free_speed_mps']):.12e} m/s")
+    print(f"Saved summary             = {result_dir / 'equilibrium_summary.json'}")
+    print(f"Saved history             = {result_dir / 'equilibrium_history.json'}")
+    if USER_RENDER_FINAL_STATE:
+        print(f"Saved mesh PNG/MSH        = {fig_dir / 'mesh_initial.png'}")
+    if history_fig_paths:
+        print("Saved history PNGs        =")
+        for path in history_fig_paths:
+            print(f"  {path}")
+
+
+if __name__ == "__main__":
+    main()
