@@ -1,4 +1,4 @@
-"""Case 2b: Pitois-2000 Fig. 5 separation-focused volumetric bridge motion.
+"""Case 2b: Pitois-2000 Fig. 5 separation with radial/axial velocity averaging.
 
 This rebuilds the deleted Case 2b source in a compact form:
 
@@ -14,15 +14,20 @@ This rebuilds the deleted Case 2b source in a compact form:
 
 Pressure note:
     This case uses a projection-style incompressible Navier-Stokes closure for
-    the volumetric force path. The pressure force uses hydrostatic pressure and
-    the discrete projection pressure that enforces continuity; the geometric
-    Laplace pressure scalar is disabled because Heron curvature already supplies
-    the surface-tension force.
+    the volumetric force path. The pressure field is reserved for hydrostatic
+    pressure and the discrete projection pressure that enforces continuity.
+    The Fig. 5 force calibration is named and applied as surface-tension
+    traction so it is not confused with continuity/NS pressure.
+
+Axisymmetric velocity note:
+    This variant keeps the imported 3-D ``.msh`` topology, but before vertex
+    advection it averages each structured ring velocity into cylindrical radial
+    and axial components. That removes azimuthal velocity variation while still
+    allowing radial contact-line sliding and axial bridge stretching.
 
 Contact-angle note:
-    The Cox-Voinov contact-line law uses a finite equilibrium contact angle
-    matching the hard-coded initial-shape build; using ``theta = 0 deg`` with
-    the imported initial geometry would drive artificial contact-line advance.
+    The Cox-Voinov contact-line law uses the complete-wetting equilibrium
+    contact angle ``theta_eq = 0 deg`` for the Pitois Case 2b baseline.
 
 Gravity note:
     The Fig. 5 experiment is not gravity-free, so this case now includes a
@@ -84,7 +89,7 @@ def _move(vertex, pos, HC, bV) -> None:
     _hyperct_move(vertex, pos, HC, bV)
 
 
-OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b"
+OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_radial_axial_velocity_avg"
 INITIALSHAPE_OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_initialshape"
 HARDCODED_INITIAL_MSH_PATH = INITIALSHAPE_OUT_ROOT / "fig" / "mesh_iter0100.msh"
 
@@ -220,20 +225,28 @@ USER_CONTACT_LINE_COX_MACRO_LENGTH_M = 1.0e-3
 USER_CONTACT_LINE_COX_SLIP_LENGTH_M = 2.0e-9
 USER_ACCEL_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 USER_ENFORCE_NO_SWIRL = True
+USER_AVERAGE_VELOCITY_RADIAL_AXIAL = True
 USER_ENABLE_NS_PRESSURE_PROJECTION = True
 USER_NS_PRESSURE_PROJECTION_MAX_ITERS = 120
 USER_NS_PRESSURE_PROJECTION_TOL = 1.0e-5
 USER_NS_PRESSURE_PROJECTION_SOR = 1.35
-USER_MATCH_INITIAL_FORCE_TO_FIG5 = True
+USER_USE_YOUNG_LAPLACE_PRESSURE = False
+USER_YOUNG_LAPLACE_PRESSURE_SCALE = 1.0
+USER_YOUNG_LAPLACE_PRESSURE_NECK_FIT_SIDE_RINGS = 2
+USER_MATCH_INITIAL_FORCE_TO_FIG5 = False
 USER_INITIAL_FORCE_CALIBRATION_MAX_ITERS = 1
 USER_ENABLE_ARRAY_FORCE_BACKEND = True
 # "numpy" is usually fastest for this moderate-size mesh on CPU. Set to
 # "torch" to route the vectorized edge algebra through PyTorch tensors.
 USER_ARRAY_FORCE_BACKEND = "numpy"
-USER_REPORT_CAP_VISCOUS_STRESS = False
+USER_REPORT_CAP_VISCOUS_STRESS = True
+USER_UPDATE_PITOIS_COMPARE_EVERY_STEP = True
+USER_USE_SURFACE_TENSION_MATCH_TRACTION_IN_REPORT = False
+USER_GAP_SCALE_SURFACE_TENSION_TRACTION = False
+USER_SURFACE_TENSION_TRACTION_GAP_EXPONENT = 0.65
 USER_VOLUME_CONSTRAINT_STOP_FRACTION = 5.0e-3
 USER_HARDCODED_INITIAL_NECK_RADIUS_RATIO = 0.6424
-USER_HARDCODED_INITIAL_CONTACT_ANGLE_DEG = 10.0
+USER_HARDCODED_INITIAL_CONTACT_ANGLE_DEG = 0.0
 
 USER_OPEN_INTERACTIVE_WINDOW = True
 USER_INTERACTIVE_STEP = USER_TOTAL_STEPS
@@ -279,8 +292,6 @@ class VolumetricPitoisConfig:
     record_every: int = USER_RECORD_EVERY_STEPS
     mesh_snapshot_every: int = USER_MESH_SNAPSHOT_EVERY_STEPS
     display_motion_scale: float = 4000.0
-    use_axisymmetric_laplace_pressure: bool = False
-    pressure_scale: float = 0.0
     include_gravity: bool = USER_INCLUDE_GRAVITY
     gravity_mps2: float = USER_GRAVITY_MPS2
     contact_radius_samples: int = USER_CONTACT_RADIUS_SAMPLES
@@ -320,19 +331,26 @@ class VolumetricPitoisConfig:
     contact_line_cox_slip_length_m: float = USER_CONTACT_LINE_COX_SLIP_LENGTH_M
     accel_workers: int = USER_ACCEL_WORKERS
     enforce_no_swirl: bool = USER_ENFORCE_NO_SWIRL
+    average_velocity_radial_axial: bool = USER_AVERAGE_VELOCITY_RADIAL_AXIAL
     enable_ns_pressure_projection: bool = USER_ENABLE_NS_PRESSURE_PROJECTION
     ns_pressure_projection_max_iters: int = USER_NS_PRESSURE_PROJECTION_MAX_ITERS
     ns_pressure_projection_tol: float = USER_NS_PRESSURE_PROJECTION_TOL
     ns_pressure_projection_sor: float = USER_NS_PRESSURE_PROJECTION_SOR
+    use_young_laplace_pressure: bool = USER_USE_YOUNG_LAPLACE_PRESSURE
+    young_laplace_pressure_scale: float = USER_YOUNG_LAPLACE_PRESSURE_SCALE
+    young_laplace_pressure_neck_fit_side_rings: int = USER_YOUNG_LAPLACE_PRESSURE_NECK_FIT_SIDE_RINGS
     match_initial_force_to_fig5: bool = USER_MATCH_INITIAL_FORCE_TO_FIG5
     initial_force_calibration_max_iters: int = USER_INITIAL_FORCE_CALIBRATION_MAX_ITERS
     enable_array_force_backend: bool = USER_ENABLE_ARRAY_FORCE_BACKEND
     array_force_backend: str = USER_ARRAY_FORCE_BACKEND
     report_cap_viscous_stress: bool = USER_REPORT_CAP_VISCOUS_STRESS
+    update_pitois_compare_every_step: bool = USER_UPDATE_PITOIS_COMPARE_EVERY_STEP
+    use_surface_tension_match_traction_in_report: bool = USER_USE_SURFACE_TENSION_MATCH_TRACTION_IN_REPORT
+    gap_scale_surface_tension_traction: bool = USER_GAP_SCALE_SURFACE_TENSION_TRACTION
+    surface_tension_traction_gap_exponent: float = USER_SURFACE_TENSION_TRACTION_GAP_EXPONENT
     volume_constraint_stop_fraction: float = USER_VOLUME_CONSTRAINT_STOP_FRACTION
-    # Contact-line equilibrium angle used by the Cox-Voinov law. The imported
-    # initial shape was built with this finite wetting angle; using 0 deg here
-    # would make the same initial geometry advance instead of recede.
+    # Contact-line equilibrium angle used by the Cox-Voinov law and Fcl.
+    # Pitois Case 2b uses a complete-wetting baseline, theta_eq = 0 deg.
     contact_angle_deg: float = USER_HARDCODED_INITIAL_CONTACT_ANGLE_DEG
 
     @property
@@ -369,7 +387,8 @@ class VolumetricPitoisState:
     target_volume_m3: float
     target_snapshot_volume_m3: float
     pressure_scalar: float = 0.0
-    force_match_pressure_offset_pa: float = 0.0
+    surface_tension_match_traction_pa: float = 0.0
+    surface_tension_match_reference_traction_pa: float = 0.0
     initial_force_calibration_target_mn: float = PITOIS_FIG5_FIRST_FORCE_MN
     initial_force_calibration_fixed_axial_mn: float = 0.0
     pressure_projection_map: dict[int, float] = field(default_factory=dict)
@@ -874,8 +893,8 @@ def _radial_ring_factors_with_outer_refinement(
 
 def separation_config() -> VolumetricPitoisConfig:
     config = VolumetricPitoisConfig(
-        name="Case_2b_volumetric_separation",
-        title="Case 2b: volumetric pre-bridged separation",
+        name="Case_2b_radial_axial_velocity_avg",
+        title="Case 2b: radial/axial averaged volumetric separation",
     )
     if bool(config.use_last_initialshape_msh):
         return _initial_msh_matched_config(config)
@@ -1094,9 +1113,9 @@ def _pressure_array_for_vertices(
     points: np.ndarray,
     *,
     include_projection: bool,
-) -> np.ndarray:
+    ) -> np.ndarray:
     vertices = geom["vertices"]
-    pressure = np.zeros(len(vertices), dtype=float)
+    pressure = np.full(len(vertices), float(getattr(state, "pressure_scalar", 0.0)), dtype=float)
     if bool(state.config.include_gravity):
         z_ref = 0.5 * float(state.bottom_sphere_center[2] + state.top_sphere_center[2])
         pressure -= float(state.config.rho_f) * float(state.config.gravity_mps2) * (points[:, 2] - z_ref)
@@ -1342,19 +1361,21 @@ def _array_advance_symplectic_step(state: VolumetricPitoisState, *, dt: float) -
 
     vertices = geom["vertices"]
     movers = []
-    targets = []
     new_velocities = []
     bV_ids = {id(v) for v in state.bV_caps}
     for idx, v in enumerate(vertices):
         if id(v) in bV_ids:
             continue
         u_new = np.asarray(v.u[:3], dtype=float) + float(dt) * accel[idx]
-        x_new = np.asarray(v.x_a[:3], dtype=float) + float(dt) * u_new
         movers.append(v)
-        targets.append(tuple(map(float, x_new)))
         new_velocities.append(u_new)
     for v, u_new in zip(movers, new_velocities):
         v.u[:3] = np.asarray(u_new, dtype=float)
+    _enforce_radial_axial_velocity_average_field(state)
+    targets = []
+    for v in movers:
+        x_new = np.asarray(v.x_a[:3], dtype=float) + float(dt) * np.asarray(v.u[:3], dtype=float)
+        targets.append(tuple(map(float, x_new)))
     _move_vertices_batch(movers, targets, state.HC, state.bV_caps)
     return True
 
@@ -1407,10 +1428,92 @@ def _axisymmetric_profile(state: VolumetricPitoisState) -> tuple[np.ndarray, np.
     return z, r, kappa_meridional + kappa_azimuthal
 
 
+def _axisymmetric_neck_curvature_from_quadratic_fit(
+    z: np.ndarray,
+    r: np.ndarray,
+    *,
+    side_rings: int,
+) -> float | None:
+    z = np.asarray(z, dtype=float)
+    r = np.asarray(r, dtype=float)
+    valid = np.isfinite(z) & np.isfinite(r) & (r > 0.0)
+    z = z[valid]
+    r = r[valid]
+    if z.size < 5:
+        return None
+
+    order = np.argsort(z)
+    z = z[order]
+    r = r[order]
+    waist_idx = int(np.argmin(r))
+    side = max(1, int(side_rings))
+    lo = max(0, waist_idx - side)
+    hi = min(len(z), waist_idx + side + 1)
+    fit_indices = [idx for idx in range(lo, hi) if idx != waist_idx]
+    if len(fit_indices) < 3:
+        fit_indices = list(range(lo, hi))
+    if len(fit_indices) < 3:
+        return None
+
+    z_ref = float(z[waist_idx])
+    zz = z[np.asarray(fit_indices, dtype=int)] - z_ref
+    rr = r[np.asarray(fit_indices, dtype=int)]
+    if np.unique(np.round(zz, 15)).size < 3:
+        return None
+
+    try:
+        a, b, c = np.polyfit(zz, rr, 2)
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        return None
+
+    r_fit = float(c)
+    if (not np.isfinite(r_fit)) or r_fit <= 1.0e-12:
+        return None
+    dr_dz = float(b)
+    d2r_dz2 = float(2.0 * a)
+    denom = max(1.0 + dr_dz * dr_dz, 1.0e-12)
+    kappa_meridional = -d2r_dz2 / float(np.power(denom, 1.5))
+    kappa_azimuthal = 1.0 / max(r_fit * float(np.sqrt(denom)), 1.0e-12)
+    kappa = kappa_meridional + kappa_azimuthal
+    if not np.isfinite(kappa):
+        return None
+    return float(kappa)
+
+
 def _update_pressure_scalar(state: VolumetricPitoisState) -> None:
     _clear_force_caches(state)
     state.pressure_projection_map.clear()
     state.pressure_scalar = 0.0
+    if bool(getattr(state.config, "use_young_laplace_pressure", False)):
+        z, _r, kappa = _axisymmetric_profile(state)
+        if z.size >= 3:
+            kappa_fit = _axisymmetric_neck_curvature_from_quadratic_fit(
+                z,
+                _r,
+                side_rings=int(getattr(state.config, "young_laplace_pressure_neck_fit_side_rings", 2)),
+            )
+            if kappa_fit is not None:
+                state.pressure_scalar = float(
+                    state.config.young_laplace_pressure_scale * state.config.gamma * kappa_fit
+                )
+            else:
+                center = len(kappa) // 2
+                lo = max(0, center - 2)
+                hi = min(len(kappa), center + 3)
+                kappa_sample = kappa[lo:hi]
+                if kappa_sample.size and np.all(np.isfinite(kappa_sample)):
+                    state.pressure_scalar = float(
+                        state.config.young_laplace_pressure_scale
+                        * state.config.gamma
+                        * np.mean(kappa_sample)
+                    )
+    if bool(getattr(state.config, "gap_scale_surface_tension_traction", False)):
+        reference_traction = float(getattr(state, "surface_tension_match_reference_traction_pa", 0.0))
+        if abs(reference_traction) > 1.0e-30:
+            initial_gap = max(abs(float(getattr(state, "initial_gap", _gap(state)))), 1.0e-12)
+            current_gap = max(abs(float(_gap(state))), 1.0e-12)
+            exponent = max(float(getattr(state.config, "surface_tension_traction_gap_exponent", 1.0)), 0.0)
+            state.surface_tension_match_traction_pa = reference_traction * (initial_gap / current_gap) ** exponent
 
 
 def _clip_acceleration(accel: np.ndarray, state: VolumetricPitoisState) -> np.ndarray:
@@ -1783,7 +1886,7 @@ def _regularize_layer_order(state: VolumetricPitoisState) -> None:
 
 
 def _base_pressure_model(v, *, HC=None, dim: int = 3, state: VolumetricPitoisState):
-    pressure = 0.0
+    pressure = float(getattr(state, "pressure_scalar", 0.0))
     if not state.config.include_gravity:
         return pressure
 
@@ -2165,6 +2268,110 @@ def _enforce_no_swirl_velocity_field(state: VolumetricPitoisState, *, vertices=N
             axis_origin=axis_origin,
             axis=axis,
         )
+
+
+def _radial_axial_components_for_point(
+    point: np.ndarray,
+    velocity: np.ndarray,
+    *,
+    axis_origin: np.ndarray,
+    axis: np.ndarray,
+) -> tuple[np.ndarray, bool, float, float]:
+    rel = np.asarray(point, dtype=float) - np.asarray(axis_origin, dtype=float)
+    axial = float(np.dot(rel, axis))
+    radial_vec = rel - axial * axis
+    radial_norm = float(np.linalg.norm(radial_vec))
+    if radial_norm <= 1.0e-30:
+        e_r = np.zeros(3, dtype=float)
+        u_r = 0.0
+        active = False
+    else:
+        e_r = radial_vec / radial_norm
+        u_r = float(np.dot(np.asarray(velocity, dtype=float), e_r))
+        active = True
+    u_z = float(np.dot(np.asarray(velocity, dtype=float), axis))
+    return e_r, active, u_r, u_z
+
+
+def _average_radial_axial_velocity_ring(
+    ring: list,
+    *,
+    axis_origin: np.ndarray,
+    axis: np.ndarray,
+) -> set[int]:
+    entries = []
+    for v in ring:
+        point = np.asarray(v.x_a[:3], dtype=float)
+        velocity = np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float)
+        e_r, active, u_r, u_z = _radial_axial_components_for_point(
+            point,
+            velocity,
+            axis_origin=axis_origin,
+            axis=axis,
+        )
+        entries.append((v, e_r, active, u_r, u_z))
+    if not entries:
+        return set()
+
+    axial_mean = float(np.mean([entry[4] for entry in entries]))
+    radial_values = [entry[3] for entry in entries if entry[2]]
+    radial_mean = float(np.mean(radial_values)) if radial_values else 0.0
+    touched: set[int] = set()
+    for v, e_r, active, _u_r, _u_z in entries:
+        averaged = axial_mean * axis
+        if active:
+            averaged = averaged + radial_mean * e_r
+        v.u = np.asarray(averaged, dtype=float)
+        touched.add(id(v))
+    return touched
+
+
+def _enforce_radial_axial_velocity_average_field(state: VolumetricPitoisState) -> None:
+    if not bool(getattr(state.config, "average_velocity_radial_axial", False)):
+        return
+    axis_origin, axis = _swirl_axis_geometry(state)
+    axis = np.asarray(axis, dtype=float)
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-30)
+
+    touched: set[int] = set()
+    for rings in list(getattr(state, "layer_rings", [])):
+        for ring in rings:
+            touched.update(
+                _average_radial_axial_velocity_ring(
+                    list(ring),
+                    axis_origin=axis_origin,
+                    axis=axis,
+                )
+            )
+
+    center_vertices = []
+    center_vertices.extend(list(getattr(state, "layer_centers", [])))
+    for name in ("cap_bottom_center", "cap_top_center"):
+        vertex = getattr(state, name, None)
+        if vertex is not None:
+            center_vertices.append(vertex)
+    for v in center_vertices:
+        if id(v) in touched:
+            continue
+        velocity = np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float)
+        v.u = float(np.dot(velocity, axis)) * axis
+        touched.add(id(v))
+
+    for v in list(state.HC.V):
+        if id(v) in touched:
+            continue
+        point = np.asarray(v.x_a[:3], dtype=float)
+        velocity = np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float)
+        e_r, active, u_r, u_z = _radial_axial_components_for_point(
+            point,
+            velocity,
+            axis_origin=axis_origin,
+            axis=axis,
+        )
+        projected = u_z * axis
+        if active:
+            projected = projected + u_r * e_r
+        v.u = np.asarray(projected, dtype=float)
 
 
 def _mean_ring_radius(ring: list, center: np.ndarray, axis: np.ndarray) -> float:
@@ -3513,7 +3720,8 @@ def _runtime_structured_remesh(
     last_dt_limit_capillary = float(getattr(state, "last_dt_limit_capillary", new_config.dt))
     last_dt_limit_mesh = float(getattr(state, "last_dt_limit_mesh", new_config.dt))
     last_dt_limiter = str(getattr(state, "last_dt_limiter", "fixed"))
-    force_match_pressure_offset_pa = float(getattr(state, "force_match_pressure_offset_pa", 0.0))
+    surface_tension_match_traction_pa = float(getattr(state, "surface_tension_match_traction_pa", 0.0))
+    surface_tension_match_reference_traction_pa = float(getattr(state, "surface_tension_match_reference_traction_pa", 0.0))
     initial_force_calibration_fixed_axial_mn = float(
         getattr(state, "initial_force_calibration_fixed_axial_mn", 0.0)
     )
@@ -3542,7 +3750,8 @@ def _runtime_structured_remesh(
     state.last_dt_limit_capillary = last_dt_limit_capillary
     state.last_dt_limit_mesh = last_dt_limit_mesh
     state.last_dt_limiter = last_dt_limiter
-    state.force_match_pressure_offset_pa = force_match_pressure_offset_pa
+    state.surface_tension_match_traction_pa = surface_tension_match_traction_pa
+    state.surface_tension_match_reference_traction_pa = surface_tension_match_reference_traction_pa
     state.initial_force_calibration_fixed_axial_mn = initial_force_calibration_fixed_axial_mn
     _clear_geometry_caches(state)
 
@@ -3915,7 +4124,8 @@ def _capture_dynamic_state(state: VolumetricPitoisState) -> dict[str, object]:
         "bottom_sphere_center": np.asarray(state.bottom_sphere_center, dtype=float).copy(),
         "top_sphere_center": np.asarray(state.top_sphere_center, dtype=float).copy(),
         "pressure_scalar": float(getattr(state, "pressure_scalar", 0.0)),
-        "force_match_pressure_offset_pa": float(getattr(state, "force_match_pressure_offset_pa", 0.0)),
+        "surface_tension_match_traction_pa": float(getattr(state, "surface_tension_match_traction_pa", 0.0)),
+        "surface_tension_match_reference_traction_pa": float(getattr(state, "surface_tension_match_reference_traction_pa", 0.0)),
         "initial_force_calibration_fixed_axial_mn": float(
             getattr(state, "initial_force_calibration_fixed_axial_mn", 0.0)
         ),
@@ -3944,7 +4154,8 @@ def _restore_dynamic_state(state: VolumetricPitoisState, snapshot: dict[str, obj
     state.bottom_sphere_center = np.asarray(snapshot["bottom_sphere_center"], dtype=float).copy()
     state.top_sphere_center = np.asarray(snapshot["top_sphere_center"], dtype=float).copy()
     state.pressure_scalar = float(snapshot["pressure_scalar"])
-    state.force_match_pressure_offset_pa = float(snapshot.get("force_match_pressure_offset_pa", 0.0))
+    state.surface_tension_match_traction_pa = float(snapshot.get("surface_tension_match_traction_pa", 0.0))
+    state.surface_tension_match_reference_traction_pa = float(snapshot.get("surface_tension_match_reference_traction_pa", 0.0))
     state.initial_force_calibration_fixed_axial_mn = float(
         snapshot.get("initial_force_calibration_fixed_axial_mn", 0.0)
     )
@@ -3962,7 +4173,9 @@ def _advance_one_substep(state: VolumetricPitoisState, *, dt: float) -> None:
     reference_volume_m3 = float(_snapshot_msh_volume_m3(state))
     _set_cap_velocities(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _move_caps(state, dt=dt)
     prev_bottom_radius = float(_cap_radius(state.outer_rings[0]))
     prev_top_radius = float(_cap_radius(state.outer_rings[-1]))
@@ -3984,8 +4197,11 @@ def _advance_one_substep(state: VolumetricPitoisState, *, dt: float) -> None:
     _constrain_contact_lines_to_spheres(state)
     _clear_geometry_caches(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _set_cap_velocities(state)
+    _enforce_radial_axial_velocity_average_field(state)
     if _uses_exact_imported_msh(state):
         if bool(getattr(state.config, "use_cox_voinov_contact_line_law", False)):
             _update_contact_line_by_cox_voinov(
@@ -4006,13 +4222,17 @@ def _advance_one_substep(state: VolumetricPitoisState, *, dt: float) -> None:
         _axisymmetrize_layer_rings(state)
         _constrain_contact_lines_to_spheres(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _assert_fixed_topology(state)
     if not _uses_exact_imported_msh(state):
         _maybe_runtime_split_merge_remesh(state)
     _assert_fixed_topology(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_step_continuity_displacement(
         state,
         reference_volume_m3=reference_volume_m3,
@@ -4242,7 +4462,7 @@ def _prepare_state(config: VolumetricPitoisConfig) -> VolumetricPitoisState:
             "Initial force calibration = "
             f"target |F| {float(PITOIS_FIG5_FIRST_FORCE_MN):.6f} mN, "
             f"fixed_axial {float(state.initial_force_calibration_fixed_axial_mn):+.6f} mN, "
-            f"pressure_offset {float(state.force_match_pressure_offset_pa):+.6e} Pa",
+            f"surface_tension_traction {float(state.surface_tension_match_traction_pa):+.6e} Pa",
             flush=True,
         )
     return state
@@ -4407,11 +4627,11 @@ def _vertex_acceleration(v, *, state: VolumetricPitoisState) -> np.ndarray:
     return accel
 
 
-def _cap_traction_force(
+def _cap_traction_force_components(
     state: VolumetricPitoisState,
     *,
     which: str,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     if which == "bottom":
         tri_idx = np.asarray(state.surface_export_bottom_cap_tris, dtype=int)
         sphere_center = np.asarray(state.bottom_sphere_center, dtype=float)
@@ -4419,16 +4639,21 @@ def _cap_traction_force(
         tri_idx = np.asarray(state.surface_export_top_cap_tris, dtype=int)
         sphere_center = np.asarray(state.top_sphere_center, dtype=float)
     if tri_idx.size == 0:
-        return np.zeros(3, dtype=float)
+        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
 
     vertices = state.surface_export_vertices
-    Fcap = np.zeros(3, dtype=float)
+    Fp = np.zeros(3, dtype=float)
+    Fmu = np.zeros(3, dtype=float)
     mu = float(state.config.mu_f)
-    report_pressure_offset = float(getattr(state, "force_match_pressure_offset_pa", 0.0))
+    report_surface_tension_traction = (
+        float(getattr(state, "surface_tension_match_traction_pa", 0.0))
+        if bool(getattr(state.config, "use_surface_tension_match_traction_in_report", False))
+        else 0.0
+    )
     include_viscous = bool(getattr(state.config, "report_cap_viscous_stress", False))
 
-    def pressure_model(vv, HC=None, dim=3):
-        return _pressure_model(vv, HC=HC, dim=dim, state=state) + report_pressure_offset
+    def normal_traction_model(vv, HC=None, dim=3):
+        return _pressure_model(vv, HC=HC, dim=dim, state=state) + report_surface_tension_traction
 
     for a, b, c in tri_idx:
         va = vertices[int(a)]
@@ -4449,20 +4674,30 @@ def _cap_traction_force(
             continue
         n_s = n_s / n_norm
 
-        pressure_tri = np.zeros((3, 3), dtype=float)
+        normal_traction_tri = np.zeros((3, 3), dtype=float)
         viscous_tri = np.zeros((3, 3), dtype=float)
         for vtx in (va, vb, vc):
-            p_v = float(pressure_model(vtx))
-            pressure_tri -= p_v * np.eye(3, dtype=float)
+            traction_v = float(normal_traction_model(vtx))
+            normal_traction_tri -= traction_v * np.eye(3, dtype=float)
             if include_viscous:
                 du_v = velocity_difference_tensor_pointwise(vtx, state.HC, dim=3)
                 viscous_tri += mu * (du_v + du_v.T)
-        sigma_tri = pressure_tri / 3.0
+        sigma_p_tri = normal_traction_tri / 3.0
+        Fp += sigma_p_tri @ n_s * area
         if include_viscous:
-            sigma_tri += viscous_tri / 3.0
-        Fcap += sigma_tri @ n_s * area
+            sigma_mu_tri = viscous_tri / 3.0
+            Fmu += sigma_mu_tri @ n_s * area
 
-    return Fcap
+    return Fp, Fmu
+
+
+def _cap_traction_force(
+    state: VolumetricPitoisState,
+    *,
+    which: str,
+) -> np.ndarray:
+    Fp, Fmu = _cap_traction_force_components(state, which=which)
+    return Fp + Fmu
 
 
 def _ordered_outer_rings_for_surface(state: VolumetricPitoisState) -> list[list[object]]:
@@ -4786,18 +5021,51 @@ def _contact_line_surface_tension_force(
     return direction_sign * force_mag * axis
 
 
+def _interface_surface_tension_resultant(
+    state: VolumetricPitoisState,
+    *,
+    which: str | None = None,
+) -> np.ndarray:
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    mid = 0.5 * (bottom_center + top_center)
+    total = np.zeros(3, dtype=float)
+    for v in state.HC.V:
+        if not getattr(v, "is_interface", False):
+            continue
+        if which in {"bottom", "top"}:
+            axial = float(np.dot(np.asarray(v.x_a[:3], dtype=float) - mid, axis))
+            if which == "bottom" and axial > 0.0:
+                continue
+            if which == "top" and axial < 0.0:
+                continue
+        total += _interface_surface_tension_force(v, state=state)
+    return total
+
+
 def _sphere_total_forces(state: VolumetricPitoisState) -> dict[str, np.ndarray]:
-    top_cap = _cap_traction_force(state, which="top")
-    bottom_cap = _cap_traction_force(state, which="bottom")
-    top_line = _contact_line_surface_tension_force(state, which="top")
-    bottom_line = _contact_line_surface_tension_force(state, which="bottom")
+    top_Fp, top_Fmu = _cap_traction_force_components(state, which="top")
+    bottom_Fp, bottom_Fmu = _cap_traction_force_components(state, which="bottom")
+    top_cap = top_Fp + top_Fmu
+    bottom_cap = bottom_Fp + bottom_Fmu
+    top_Fcl = _contact_line_surface_tension_force(state, which="top")
+    bottom_Fcl = _contact_line_surface_tension_force(state, which="bottom")
+    top_Fs = _interface_surface_tension_resultant(state, which="top")
+    bottom_Fs = _interface_surface_tension_resultant(state, which="bottom")
     return {
-        "top_total": top_cap + top_line,
-        "bottom_total": bottom_cap + bottom_line,
+        "top_total": top_cap + top_Fcl,
+        "bottom_total": bottom_cap + bottom_Fcl,
         "top_cap": top_cap,
         "bottom_cap": bottom_cap,
-        "top_line": top_line,
-        "bottom_line": bottom_line,
+        "top_Fp": top_Fp,
+        "bottom_Fp": bottom_Fp,
+        "top_Fmu": top_Fmu,
+        "bottom_Fmu": bottom_Fmu,
+        "top_Fs": top_Fs,
+        "bottom_Fs": bottom_Fs,
+        "top_Fcl": top_Fcl,
+        "bottom_Fcl": bottom_Fcl,
+        "top_line": top_Fcl,
+        "bottom_line": bottom_Fcl,
     }
 
 
@@ -4805,13 +5073,13 @@ def _fixed_sphere_axial_force_n(state: VolumetricPitoisState) -> float:
     return float(_sphere_total_forces(state)["top_total"][2])
 
 
-def _fixed_force_pressure_sensitivity_n_per_pa(state: VolumetricPitoisState) -> float:
-    old_offset = float(getattr(state, "force_match_pressure_offset_pa", 0.0))
+def _fixed_force_surface_tension_traction_sensitivity_n_per_pa(state: VolumetricPitoisState) -> float:
+    old_traction = float(getattr(state, "surface_tension_match_traction_pa", 0.0))
     current = _fixed_sphere_axial_force_n(state)
-    state.force_match_pressure_offset_pa = old_offset + 1.0
+    state.surface_tension_match_traction_pa = old_traction + 1.0
     _clear_force_caches(state)
     shifted = _fixed_sphere_axial_force_n(state)
-    state.force_match_pressure_offset_pa = old_offset
+    state.surface_tension_match_traction_pa = old_traction
     _clear_force_caches(state)
     return float(shifted - current)
 
@@ -4819,6 +5087,8 @@ def _fixed_force_pressure_sensitivity_n_per_pa(state: VolumetricPitoisState) -> 
 def _calibrate_initial_force_to_pitois_first_point(state: VolumetricPitoisState, *, dt: float) -> None:
     state.initial_force_calibration_target_mn = float(PITOIS_FIG5_FIRST_FORCE_MN)
     if not bool(getattr(state.config, "match_initial_force_to_fig5", False)):
+        state.surface_tension_match_reference_traction_pa = 0.0
+        state.surface_tension_match_traction_pa = 0.0
         state.initial_force_calibration_fixed_axial_mn = 1.0e3 * _fixed_sphere_axial_force_n(state)
         return
 
@@ -4834,16 +5104,18 @@ def _calibrate_initial_force_to_pitois_first_point(state: VolumetricPitoisState,
         if abs(error_n) <= 1.0e-9 * max(target_mag_n, 1.0e-30):
             break
 
-        sensitivity = _fixed_force_pressure_sensitivity_n_per_pa(state)
+        sensitivity = _fixed_force_surface_tension_traction_sensitivity_n_per_pa(state)
         if abs(sensitivity) <= 1.0e-30 or not np.isfinite(sensitivity):
             break
         delta_p = error_n / sensitivity
         if not np.isfinite(delta_p):
             break
-        state.force_match_pressure_offset_pa += float(delta_p)
+        state.surface_tension_match_traction_pa += float(delta_p)
         _clear_force_caches(state)
 
     _solve_ns_projection_pressure(state, dt=dt)
+    state.surface_tension_match_reference_traction_pa = float(state.surface_tension_match_traction_pa)
+    _update_pressure_scalar(state)
     state.initial_force_calibration_fixed_axial_mn = 1.0e3 * _fixed_sphere_axial_force_n(state)
 
 
@@ -4974,10 +5246,26 @@ def _step_record(state: VolumetricPitoisState, *, step: int, t: float) -> dict[s
         "moving_force_mag": float(np.linalg.norm(moving_force)),
         "top_cap_traction": sphere_forces["top_cap"].tolist(),
         "bottom_cap_traction": sphere_forces["bottom_cap"].tolist(),
+        "top_Fp": sphere_forces["top_Fp"].tolist(),
+        "bottom_Fp": sphere_forces["bottom_Fp"].tolist(),
+        "top_Fmu": sphere_forces["top_Fmu"].tolist(),
+        "bottom_Fmu": sphere_forces["bottom_Fmu"].tolist(),
+        "top_Fs": sphere_forces["top_Fs"].tolist(),
+        "bottom_Fs": sphere_forces["bottom_Fs"].tolist(),
+        "top_Fcl": sphere_forces["top_Fcl"].tolist(),
+        "bottom_Fcl": sphere_forces["bottom_Fcl"].tolist(),
         "top_contact_line_force": sphere_forces["top_line"].tolist(),
         "bottom_contact_line_force": sphere_forces["bottom_line"].tolist(),
         "top_cap_traction_axial": float(sphere_forces["top_cap"][2]),
         "bottom_cap_traction_axial": float(sphere_forces["bottom_cap"][2]),
+        "top_Fp_axial": float(sphere_forces["top_Fp"][2]),
+        "bottom_Fp_axial": float(sphere_forces["bottom_Fp"][2]),
+        "top_Fmu_axial": float(sphere_forces["top_Fmu"][2]),
+        "bottom_Fmu_axial": float(sphere_forces["bottom_Fmu"][2]),
+        "top_Fs_axial": float(sphere_forces["top_Fs"][2]),
+        "bottom_Fs_axial": float(sphere_forces["bottom_Fs"][2]),
+        "top_Fcl_axial": float(sphere_forces["top_Fcl"][2]),
+        "bottom_Fcl_axial": float(sphere_forces["bottom_Fcl"][2]),
         "top_contact_line_axial": float(sphere_forces["top_line"][2]),
         "bottom_contact_line_axial": float(sphere_forces["bottom_line"][2]),
         "bottom_contact_radius": float(_cap_radius(state.outer_rings[0])),
@@ -4993,7 +5281,7 @@ def _step_record(state: VolumetricPitoisState, *, step: int, t: float) -> dict[s
         "top_contact_line_speed": float(state.last_top_contact_line_speed),
         "max_free_speed": _max_free_speed(state),
         "pressure_scalar": float(state.pressure_scalar),
-        "force_match_pressure_offset_pa": float(getattr(state, "force_match_pressure_offset_pa", 0.0)),
+        "surface_tension_match_traction_pa": float(getattr(state, "surface_tension_match_traction_pa", 0.0)),
         "initial_force_calibration_target_mn": float(getattr(state, "initial_force_calibration_target_mn", 0.0)),
         "initial_force_calibration_fixed_axial_mn": float(
             getattr(state, "initial_force_calibration_fixed_axial_mn", 0.0)
@@ -6208,6 +6496,28 @@ def _save_case2b_histories_panel(*, separation: dict[str, np.ndarray], out_path:
     return out_path
 
 
+def _write_pitois_fig5_live_compare(
+    *,
+    separation_history: list[dict],
+    out_dir: Path,
+) -> Path | None:
+    if not separation_history:
+        return None
+    fig_dir = out_dir / "fig"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    separation = _history_arrays(separation_history)
+    exp_x, exp_y = _pitois_fig5_dynamic_digitized()
+    return _save_pitois_fig5_compare(
+        exp_x=exp_x,
+        exp_y=exp_y,
+        sim_x=separation["d_over_r"],
+        sim_y=separation["force_abs_mn"],
+        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare.png",
+        xlim=(0.01, 0.30),
+        ylim=(0.02, 2.0),
+    )
+
+
 def _write_pitois_fig5_comparison(
     *,
     separation_history: list[dict],
@@ -6221,15 +6531,7 @@ def _write_pitois_fig5_comparison(
     separation = _history_arrays(separation_history)
     exp_x, exp_y = _pitois_fig5_dynamic_digitized()
 
-    _save_pitois_fig5_compare(
-        exp_x=exp_x,
-        exp_y=exp_y,
-        sim_x=separation["d_over_r"],
-        sim_y=separation["force_abs_mn"],
-        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare.png",
-        xlim=(0.01, 0.30),
-        ylim=(0.02, 2.0),
-    )
+    _write_pitois_fig5_live_compare(separation_history=separation_history, out_dir=out_dir)
     _save_pitois_fig5_compare(
         exp_x=exp_x,
         exp_y=exp_y,
@@ -6304,7 +6606,7 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
     print(f"Gravity included          = {'yes' if config.include_gravity else 'no'}")
     if config.include_gravity:
         print(f"Gravity acceleration      = {config.gravity_mps2:.3f} m/s^2")
-    print(f"Contact angle assumption  = {config.contact_angle_deg:.1f} deg (literature-informed baseline)")
+    print(f"Contact angle assumption  = {config.contact_angle_deg:.1f} deg (complete-wetting baseline)")
     print(f"CL Cox-Voinov law         = {'on' if config.use_cox_voinov_contact_line_law else 'off'}")
     print(f"Moving-sphere speed       = {config.cap_speed * 1e6:.3f} um/s")
     print(f"Relative speed            = {config.relative_speed * 1e6:.3f} um/s")
@@ -6313,7 +6615,10 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
     print(f"Integration substeps      = {config.integration_substeps}")
     print(f"Contact-radius samples    = {config.contact_radius_samples}")
     print(f"Volume constraint         = {'on' if config.enable_continuity_pressure else 'off'}")
-    print("Laplace pressure scalar   = off (Heron surface tension force used)")
+    print("Laplace surface tension   = Heron curvature force")
+    print(f"Young-Laplace pressure   = {'on' if config.use_young_laplace_pressure else 'off'}")
+    if config.use_young_laplace_pressure:
+        print(f"Young-Laplace scale      = {config.young_laplace_pressure_scale:.3f}")
     print(f"NS pressure projection    = {'on' if config.enable_ns_pressure_projection else 'off'}")
     if config.enable_ns_pressure_projection:
         print(f"NS projection max iters   = {config.ns_pressure_projection_max_iters}")
@@ -6328,9 +6633,22 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
         f"{config.array_force_backend if config.enable_array_force_backend else 'off'}"
     )
     print(f"Report cap viscous stress = {'on' if config.report_cap_viscous_stress else 'off'}")
+    print(f"Live Fig.5 compare PNG   = {'on' if config.update_pitois_compare_every_step else 'off'}")
+    print(f"Initial force matching   = {'on' if config.match_initial_force_to_fig5 else 'off'}")
+    print(
+        "Surface-tension match F= "
+        f"{'on' if config.use_surface_tension_match_traction_in_report else 'off'}"
+    )
+    print(
+        "Gap-scaled surf tension= "
+        f"{'on' if config.gap_scale_surface_tension_traction else 'off'}"
+    )
+    if config.gap_scale_surface_tension_traction:
+        print(f"Surface tension gap exp  = {config.surface_tension_traction_gap_exponent:.3f}")
     print(f"Volume stop tolerance    = {100.0 * config.volume_constraint_stop_fraction:.4f} %")
     print(f"Mesh-quality guard       = {'on' if config.enable_mesh_quality_guard else 'off'}")
     print(f"No-swirl enforcement      = {'on' if config.enforce_no_swirl else 'off'}")
+    print(f"Radial/axial velocity avg = {'on' if config.average_velocity_radial_axial else 'off'}")
     if config.dt > 0.0:
         print("Adaptive dt               = off (using USER_DT_S)")
         print(f"dt                        = {config.dt:.3e} s")
@@ -6400,6 +6718,15 @@ def _print_step_status(
         flush=True,
     )
     print(
+        "F components top         = "
+        f"Fp {1.0e3 * float(record_row['top_Fp_axial']):+.6e} mN, "
+        f"Fmu {1.0e3 * float(record_row['top_Fmu_axial']):+.6e} mN, "
+        f"Fs(interface) {1.0e3 * float(record_row['top_Fs_axial']):+.6e} mN, "
+        f"Fcl {1.0e3 * float(record_row['top_Fcl_axial']):+.6e} mN, "
+        f"Ftot {1.0e3 * float(record_row['top_force_axial']):+.6e} mN",
+        flush=True,
+    )
+    print(
         "NS projection            = "
         f"iters {int(record_row['ns_projection_iterations'])}, "
         f"div_l2 {float(record_row['ns_divergence_l2']):.6e} -> "
@@ -6450,6 +6777,8 @@ def run_motion_case(
             snapshot_volume_ul=initial_snapshot_volume_ul,
             initial_snapshot_volume_ul=initial_snapshot_volume_ul,
         )
+    if save_fig and bool(getattr(config, "update_pitois_compare_every_step", False)):
+        _write_pitois_fig5_live_compare(separation_history=history, out_dir=out_dir)
 
     for step in range(config.n_steps):
         step_dt = _select_physical_dt(state)
@@ -6465,7 +6794,8 @@ def run_motion_case(
         completed_step = step + 1
         should_record_step = completed_step % max(1, config.record_every) == 0
         record_row = None
-        if verbose or should_record_step:
+        update_live_compare = save_fig and bool(getattr(config, "update_pitois_compare_every_step", False))
+        if verbose or should_record_step or update_live_compare:
             record_row = _step_record(state, step=completed_step, t=state.elapsed_time_s)
         if verbose:
             snapshot_volume_ul = 1.0e9 * _snapshot_msh_volume_m3(state)
@@ -6480,6 +6810,11 @@ def run_motion_case(
             )
         if should_record_step:
             history.append(record_row)
+            live_history = history
+        else:
+            live_history = history + [record_row]
+        if update_live_compare:
+            _write_pitois_fig5_live_compare(separation_history=live_history, out_dir=out_dir)
 
         if interactive_step is not None and completed_step == max(0, int(interactive_step)):
             _show_state_interactive(

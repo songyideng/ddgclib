@@ -1,4 +1,4 @@
-"""Case 2b: Pitois-2000 Fig. 5 separation-focused volumetric bridge motion.
+"""Case 2b: Pitois-2000 Fig. 5 separation with radial/axial velocity averaging.
 
 This rebuilds the deleted Case 2b source in a compact form:
 
@@ -18,6 +18,12 @@ Pressure note:
     the discrete projection pressure that enforces continuity; the geometric
     Laplace pressure scalar is disabled because Heron curvature already supplies
     the surface-tension force.
+
+Axisymmetric velocity note:
+    This variant keeps the imported 3-D ``.msh`` topology, but before vertex
+    advection it averages each structured ring velocity into cylindrical radial
+    and axial components. That removes azimuthal velocity variation while still
+    allowing radial contact-line sliding and axial bridge stretching.
 
 Contact-angle note:
     The Cox-Voinov contact-line law uses a finite equilibrium contact angle
@@ -84,7 +90,7 @@ def _move(vertex, pos, HC, bV) -> None:
     _hyperct_move(vertex, pos, HC, bV)
 
 
-OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b"
+OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_radial_axial_velocity_avg"
 INITIALSHAPE_OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_initialshape"
 HARDCODED_INITIAL_MSH_PATH = INITIALSHAPE_OUT_ROOT / "fig" / "mesh_iter0100.msh"
 
@@ -220,17 +226,20 @@ USER_CONTACT_LINE_COX_MACRO_LENGTH_M = 1.0e-3
 USER_CONTACT_LINE_COX_SLIP_LENGTH_M = 2.0e-9
 USER_ACCEL_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 USER_ENFORCE_NO_SWIRL = True
+USER_AVERAGE_VELOCITY_RADIAL_AXIAL = True
 USER_ENABLE_NS_PRESSURE_PROJECTION = True
 USER_NS_PRESSURE_PROJECTION_MAX_ITERS = 120
 USER_NS_PRESSURE_PROJECTION_TOL = 1.0e-5
 USER_NS_PRESSURE_PROJECTION_SOR = 1.35
-USER_MATCH_INITIAL_FORCE_TO_FIG5 = True
+USER_MATCH_INITIAL_FORCE_TO_FIG5 = False
 USER_INITIAL_FORCE_CALIBRATION_MAX_ITERS = 1
 USER_ENABLE_ARRAY_FORCE_BACKEND = True
 # "numpy" is usually fastest for this moderate-size mesh on CPU. Set to
 # "torch" to route the vectorized edge algebra through PyTorch tensors.
 USER_ARRAY_FORCE_BACKEND = "numpy"
 USER_REPORT_CAP_VISCOUS_STRESS = False
+USER_UPDATE_PITOIS_COMPARE_EVERY_STEP = True
+USER_USE_FORCE_MATCH_PRESSURE_OFFSET_IN_REPORT = False
 USER_VOLUME_CONSTRAINT_STOP_FRACTION = 5.0e-3
 USER_HARDCODED_INITIAL_NECK_RADIUS_RATIO = 0.6424
 USER_HARDCODED_INITIAL_CONTACT_ANGLE_DEG = 10.0
@@ -320,6 +329,7 @@ class VolumetricPitoisConfig:
     contact_line_cox_slip_length_m: float = USER_CONTACT_LINE_COX_SLIP_LENGTH_M
     accel_workers: int = USER_ACCEL_WORKERS
     enforce_no_swirl: bool = USER_ENFORCE_NO_SWIRL
+    average_velocity_radial_axial: bool = USER_AVERAGE_VELOCITY_RADIAL_AXIAL
     enable_ns_pressure_projection: bool = USER_ENABLE_NS_PRESSURE_PROJECTION
     ns_pressure_projection_max_iters: int = USER_NS_PRESSURE_PROJECTION_MAX_ITERS
     ns_pressure_projection_tol: float = USER_NS_PRESSURE_PROJECTION_TOL
@@ -329,6 +339,8 @@ class VolumetricPitoisConfig:
     enable_array_force_backend: bool = USER_ENABLE_ARRAY_FORCE_BACKEND
     array_force_backend: str = USER_ARRAY_FORCE_BACKEND
     report_cap_viscous_stress: bool = USER_REPORT_CAP_VISCOUS_STRESS
+    update_pitois_compare_every_step: bool = USER_UPDATE_PITOIS_COMPARE_EVERY_STEP
+    use_force_match_pressure_offset_in_report: bool = USER_USE_FORCE_MATCH_PRESSURE_OFFSET_IN_REPORT
     volume_constraint_stop_fraction: float = USER_VOLUME_CONSTRAINT_STOP_FRACTION
     # Contact-line equilibrium angle used by the Cox-Voinov law. The imported
     # initial shape was built with this finite wetting angle; using 0 deg here
@@ -874,8 +886,8 @@ def _radial_ring_factors_with_outer_refinement(
 
 def separation_config() -> VolumetricPitoisConfig:
     config = VolumetricPitoisConfig(
-        name="Case_2b_volumetric_separation",
-        title="Case 2b: volumetric pre-bridged separation",
+        name="Case_2b_radial_axial_velocity_avg",
+        title="Case 2b: radial/axial averaged volumetric separation",
     )
     if bool(config.use_last_initialshape_msh):
         return _initial_msh_matched_config(config)
@@ -1342,19 +1354,21 @@ def _array_advance_symplectic_step(state: VolumetricPitoisState, *, dt: float) -
 
     vertices = geom["vertices"]
     movers = []
-    targets = []
     new_velocities = []
     bV_ids = {id(v) for v in state.bV_caps}
     for idx, v in enumerate(vertices):
         if id(v) in bV_ids:
             continue
         u_new = np.asarray(v.u[:3], dtype=float) + float(dt) * accel[idx]
-        x_new = np.asarray(v.x_a[:3], dtype=float) + float(dt) * u_new
         movers.append(v)
-        targets.append(tuple(map(float, x_new)))
         new_velocities.append(u_new)
     for v, u_new in zip(movers, new_velocities):
         v.u[:3] = np.asarray(u_new, dtype=float)
+    _enforce_radial_axial_velocity_average_field(state)
+    targets = []
+    for v in movers:
+        x_new = np.asarray(v.x_a[:3], dtype=float) + float(dt) * np.asarray(v.u[:3], dtype=float)
+        targets.append(tuple(map(float, x_new)))
     _move_vertices_batch(movers, targets, state.HC, state.bV_caps)
     return True
 
@@ -2165,6 +2179,110 @@ def _enforce_no_swirl_velocity_field(state: VolumetricPitoisState, *, vertices=N
             axis_origin=axis_origin,
             axis=axis,
         )
+
+
+def _radial_axial_components_for_point(
+    point: np.ndarray,
+    velocity: np.ndarray,
+    *,
+    axis_origin: np.ndarray,
+    axis: np.ndarray,
+) -> tuple[np.ndarray, bool, float, float]:
+    rel = np.asarray(point, dtype=float) - np.asarray(axis_origin, dtype=float)
+    axial = float(np.dot(rel, axis))
+    radial_vec = rel - axial * axis
+    radial_norm = float(np.linalg.norm(radial_vec))
+    if radial_norm <= 1.0e-30:
+        e_r = np.zeros(3, dtype=float)
+        u_r = 0.0
+        active = False
+    else:
+        e_r = radial_vec / radial_norm
+        u_r = float(np.dot(np.asarray(velocity, dtype=float), e_r))
+        active = True
+    u_z = float(np.dot(np.asarray(velocity, dtype=float), axis))
+    return e_r, active, u_r, u_z
+
+
+def _average_radial_axial_velocity_ring(
+    ring: list,
+    *,
+    axis_origin: np.ndarray,
+    axis: np.ndarray,
+) -> set[int]:
+    entries = []
+    for v in ring:
+        point = np.asarray(v.x_a[:3], dtype=float)
+        velocity = np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float)
+        e_r, active, u_r, u_z = _radial_axial_components_for_point(
+            point,
+            velocity,
+            axis_origin=axis_origin,
+            axis=axis,
+        )
+        entries.append((v, e_r, active, u_r, u_z))
+    if not entries:
+        return set()
+
+    axial_mean = float(np.mean([entry[4] for entry in entries]))
+    radial_values = [entry[3] for entry in entries if entry[2]]
+    radial_mean = float(np.mean(radial_values)) if radial_values else 0.0
+    touched: set[int] = set()
+    for v, e_r, active, _u_r, _u_z in entries:
+        averaged = axial_mean * axis
+        if active:
+            averaged = averaged + radial_mean * e_r
+        v.u = np.asarray(averaged, dtype=float)
+        touched.add(id(v))
+    return touched
+
+
+def _enforce_radial_axial_velocity_average_field(state: VolumetricPitoisState) -> None:
+    if not bool(getattr(state.config, "average_velocity_radial_axial", False)):
+        return
+    axis_origin, axis = _swirl_axis_geometry(state)
+    axis = np.asarray(axis, dtype=float)
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-30)
+
+    touched: set[int] = set()
+    for rings in list(getattr(state, "layer_rings", [])):
+        for ring in rings:
+            touched.update(
+                _average_radial_axial_velocity_ring(
+                    list(ring),
+                    axis_origin=axis_origin,
+                    axis=axis,
+                )
+            )
+
+    center_vertices = []
+    center_vertices.extend(list(getattr(state, "layer_centers", [])))
+    for name in ("cap_bottom_center", "cap_top_center"):
+        vertex = getattr(state, name, None)
+        if vertex is not None:
+            center_vertices.append(vertex)
+    for v in center_vertices:
+        if id(v) in touched:
+            continue
+        velocity = np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float)
+        v.u = float(np.dot(velocity, axis)) * axis
+        touched.add(id(v))
+
+    for v in list(state.HC.V):
+        if id(v) in touched:
+            continue
+        point = np.asarray(v.x_a[:3], dtype=float)
+        velocity = np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float)
+        e_r, active, u_r, u_z = _radial_axial_components_for_point(
+            point,
+            velocity,
+            axis_origin=axis_origin,
+            axis=axis,
+        )
+        projected = u_z * axis
+        if active:
+            projected = projected + u_r * e_r
+        v.u = np.asarray(projected, dtype=float)
 
 
 def _mean_ring_radius(ring: list, center: np.ndarray, axis: np.ndarray) -> float:
@@ -3962,7 +4080,9 @@ def _advance_one_substep(state: VolumetricPitoisState, *, dt: float) -> None:
     reference_volume_m3 = float(_snapshot_msh_volume_m3(state))
     _set_cap_velocities(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _move_caps(state, dt=dt)
     prev_bottom_radius = float(_cap_radius(state.outer_rings[0]))
     prev_top_radius = float(_cap_radius(state.outer_rings[-1]))
@@ -3984,8 +4104,11 @@ def _advance_one_substep(state: VolumetricPitoisState, *, dt: float) -> None:
     _constrain_contact_lines_to_spheres(state)
     _clear_geometry_caches(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _set_cap_velocities(state)
+    _enforce_radial_axial_velocity_average_field(state)
     if _uses_exact_imported_msh(state):
         if bool(getattr(state.config, "use_cox_voinov_contact_line_law", False)):
             _update_contact_line_by_cox_voinov(
@@ -4006,13 +4129,17 @@ def _advance_one_substep(state: VolumetricPitoisState, *, dt: float) -> None:
         _axisymmetrize_layer_rings(state)
         _constrain_contact_lines_to_spheres(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _assert_fixed_topology(state)
     if not _uses_exact_imported_msh(state):
         _maybe_runtime_split_merge_remesh(state)
     _assert_fixed_topology(state)
     _enforce_no_swirl_velocity_field(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_continuity_velocity_constraint(state)
+    _enforce_radial_axial_velocity_average_field(state)
     _enforce_step_continuity_displacement(
         state,
         reference_volume_m3=reference_volume_m3,
@@ -4424,7 +4551,11 @@ def _cap_traction_force(
     vertices = state.surface_export_vertices
     Fcap = np.zeros(3, dtype=float)
     mu = float(state.config.mu_f)
-    report_pressure_offset = float(getattr(state, "force_match_pressure_offset_pa", 0.0))
+    report_pressure_offset = (
+        float(getattr(state, "force_match_pressure_offset_pa", 0.0))
+        if bool(getattr(state.config, "use_force_match_pressure_offset_in_report", False))
+        else 0.0
+    )
     include_viscous = bool(getattr(state.config, "report_cap_viscous_stress", False))
 
     def pressure_model(vv, HC=None, dim=3):
@@ -6208,6 +6339,28 @@ def _save_case2b_histories_panel(*, separation: dict[str, np.ndarray], out_path:
     return out_path
 
 
+def _write_pitois_fig5_live_compare(
+    *,
+    separation_history: list[dict],
+    out_dir: Path,
+) -> Path | None:
+    if not separation_history:
+        return None
+    fig_dir = out_dir / "fig"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    separation = _history_arrays(separation_history)
+    exp_x, exp_y = _pitois_fig5_dynamic_digitized()
+    return _save_pitois_fig5_compare(
+        exp_x=exp_x,
+        exp_y=exp_y,
+        sim_x=separation["d_over_r"],
+        sim_y=separation["force_abs_mn"],
+        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare.png",
+        xlim=(0.01, 0.30),
+        ylim=(0.02, 2.0),
+    )
+
+
 def _write_pitois_fig5_comparison(
     *,
     separation_history: list[dict],
@@ -6221,15 +6374,7 @@ def _write_pitois_fig5_comparison(
     separation = _history_arrays(separation_history)
     exp_x, exp_y = _pitois_fig5_dynamic_digitized()
 
-    _save_pitois_fig5_compare(
-        exp_x=exp_x,
-        exp_y=exp_y,
-        sim_x=separation["d_over_r"],
-        sim_y=separation["force_abs_mn"],
-        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare.png",
-        xlim=(0.01, 0.30),
-        ylim=(0.02, 2.0),
-    )
+    _write_pitois_fig5_live_compare(separation_history=separation_history, out_dir=out_dir)
     _save_pitois_fig5_compare(
         exp_x=exp_x,
         exp_y=exp_y,
@@ -6328,9 +6473,16 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
         f"{config.array_force_backend if config.enable_array_force_backend else 'off'}"
     )
     print(f"Report cap viscous stress = {'on' if config.report_cap_viscous_stress else 'off'}")
+    print(f"Live Fig.5 compare PNG   = {'on' if config.update_pitois_compare_every_step else 'off'}")
+    print(f"Initial force matching   = {'on' if config.match_initial_force_to_fig5 else 'off'}")
+    print(
+        "Force-match pressure in F= "
+        f"{'on' if config.use_force_match_pressure_offset_in_report else 'off'}"
+    )
     print(f"Volume stop tolerance    = {100.0 * config.volume_constraint_stop_fraction:.4f} %")
     print(f"Mesh-quality guard       = {'on' if config.enable_mesh_quality_guard else 'off'}")
     print(f"No-swirl enforcement      = {'on' if config.enforce_no_swirl else 'off'}")
+    print(f"Radial/axial velocity avg = {'on' if config.average_velocity_radial_axial else 'off'}")
     if config.dt > 0.0:
         print("Adaptive dt               = off (using USER_DT_S)")
         print(f"dt                        = {config.dt:.3e} s")
@@ -6450,6 +6602,8 @@ def run_motion_case(
             snapshot_volume_ul=initial_snapshot_volume_ul,
             initial_snapshot_volume_ul=initial_snapshot_volume_ul,
         )
+    if save_fig and bool(getattr(config, "update_pitois_compare_every_step", False)):
+        _write_pitois_fig5_live_compare(separation_history=history, out_dir=out_dir)
 
     for step in range(config.n_steps):
         step_dt = _select_physical_dt(state)
@@ -6465,7 +6619,8 @@ def run_motion_case(
         completed_step = step + 1
         should_record_step = completed_step % max(1, config.record_every) == 0
         record_row = None
-        if verbose or should_record_step:
+        update_live_compare = save_fig and bool(getattr(config, "update_pitois_compare_every_step", False))
+        if verbose or should_record_step or update_live_compare:
             record_row = _step_record(state, step=completed_step, t=state.elapsed_time_s)
         if verbose:
             snapshot_volume_ul = 1.0e9 * _snapshot_msh_volume_m3(state)
@@ -6480,6 +6635,11 @@ def run_motion_case(
             )
         if should_record_step:
             history.append(record_row)
+            live_history = history
+        else:
+            live_history = history + [record_row]
+        if update_live_compare:
+            _write_pitois_fig5_live_compare(separation_history=live_history, out_dir=out_dir)
 
         if interactive_step is not None and completed_step == max(0, int(interactive_step)):
             _show_state_interactive(

@@ -53,9 +53,7 @@ from cases_dynamic.liquid_bridge_coupled_collision.case_2b_axisym import (
 OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_initialshape"
 
 PDF_PARTICLE_RADIUS_M = 4.0e-3
-# Pitois Fig. 5 first black filled marker on the log x-axis: D/R ~= 0.01445.
-PDF_INITIAL_D_OVER_R = 0.01445729462258473
-PDF_INITIAL_SEPARATION_D_M = PDF_INITIAL_D_OVER_R * PDF_PARTICLE_RADIUS_M
+PDF_INITIAL_SEPARATION_D_M = 0.0
 PDF_BRIDGE_VOLUME_M3 = 1.10e-9
 PDF_SURFACE_TENSION_NPM = 21.0e-3
 PDF_LIQUID2_VISCOSITY_PAS = 100.0e-3
@@ -86,38 +84,20 @@ USER_CONTACT_LINE_RADIAL_RINGS = 3
 # Additional outer-band rings near the contact line.
 USER_EXTRA_CL_RADIAL_RINGS = 4
 # Extra axial rings inserted next to the two contact lines.
-USER_CL_EXTRA_AXIAL_LAYERS = 12
+USER_CL_EXTRA_AXIAL_LAYERS = 4
 # 1 keeps all sidewall axial rings. 2 keeps every other axial ring, etc.
-# This is the actual waist-density control: increase it when the neck band is
-# too dark from too many axial interface layers.
 USER_SIDEWALL_AXIAL_RING_STRIDE = 1
 # 1.0 = equal radial spacing in the outer CL band. Values above 1.0 make the
 # mesh slightly finer right next to the contact line.
-USER_CL_RADIAL_BIAS_RATIO = 1.1
+USER_CL_RADIAL_BIAS_RATIO = 1.4
 # Liquid-air interface meridian sampling from contact line to bridge center:
 # 1.1 means each inward radial gap is 1.1x the previous gap, so the interface
 # mesh is finer at the CL and gradually coarser toward the neck.
 USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO = 1.1
-# Second meshing stage after the CL-to-neck 1.1 distribution.
-# Keep this at zero unless the neck is visibly under-resolved; nonzero values
-# create the dark dense band at the bridge waist.
-USER_INTERFACE_NECK_REFINEMENT_GAPS = 0
-USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP = 0
-# Real HyperCT axial layers inserted around the liquid-bridge neck before tetra
-# connectivity is built. This is actual .msh refinement, not a display overlay.
-USER_INTERFACE_NECK_EXTRA_AXIAL_LAYERS = (
-    2 * USER_INTERFACE_NECK_REFINEMENT_GAPS * USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP
-)
-# Generate six HyperCT .msh sets and exit instead of doing the slow relaxation.
-USER_GENERATE_MESH_LEVEL_SETS = True
-USER_MESH_LEVEL_ORDER = (
-    "fine",
-    "medium_fine",
-    "medium",
-    "medium_coarse",
-    "coarse",
-    "coarser",
-)
+# Second meshing stage after the CL-to-neck 1.1 distribution: add extra rings
+# around the bridge neck so the waist region is not left as the coarsest band.
+USER_INTERFACE_NECK_REFINEMENT_GAPS = 2
+USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP = 3
 USER_RELAX_DT_S = 2.0e-5
 USER_TOTAL_ITERATIONS = 100
 USER_RELAX_DAMPING = 20.0
@@ -153,96 +133,6 @@ USER_RENDER_INITIAL_GUESS = True
 USER_RENDER_FINAL_STATE = True
 USER_OPEN_INTERACTIVE_WINDOW = False
 USER_INTERACTIVE_STEP = USER_TOTAL_ITERATIONS
-
-
-def _current_mesh_spec() -> dict[str, int | float | str]:
-    return {
-        "name": "medium",
-        "contact_line_nodes": int(USER_CONTACT_LINE_NODES),
-        "contact_line_radial_rings": int(USER_CONTACT_LINE_RADIAL_RINGS),
-        "extra_cl_radial_rings": int(USER_EXTRA_CL_RADIAL_RINGS),
-        "cl_extra_axial_layers": int(USER_CL_EXTRA_AXIAL_LAYERS),
-        "axial_ring_stride": int(USER_SIDEWALL_AXIAL_RING_STRIDE),
-        "cl_radial_bias_ratio": float(USER_CL_RADIAL_BIAS_RATIO),
-        "interface_radial_distribution_ratio": float(USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO),
-        "interface_neck_refinement_gaps": int(USER_INTERFACE_NECK_REFINEMENT_GAPS),
-        "interface_neck_extra_rings_per_gap": int(USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP),
-        "interface_neck_extra_axial_layers": int(USER_INTERFACE_NECK_EXTRA_AXIAL_LAYERS),
-    }
-
-
-def _mesh_level_specs() -> dict[str, dict[str, int | float | str]]:
-    medium = _current_mesh_spec()
-
-    def spec(name: str, **changes) -> dict[str, int | float | str]:
-        out = dict(medium)
-        out["name"] = name
-        out.update(changes)
-        out["interface_neck_extra_axial_layers"] = int(
-            changes.get(
-                "interface_neck_extra_axial_layers",
-                2
-                * int(out["interface_neck_refinement_gaps"])
-                * int(out["interface_neck_extra_rings_per_gap"]),
-            )
-        )
-        return out
-
-    return {
-        "fine": spec(
-            "fine",
-            contact_line_nodes=16,
-            axial_ring_stride=1,
-            extra_cl_radial_rings=6,
-            cl_extra_axial_layers=28,
-            interface_neck_refinement_gaps=0,
-            interface_neck_extra_rings_per_gap=0,
-        ),
-        "medium_fine": spec(
-            "medium_fine",
-            contact_line_nodes=8,
-            axial_ring_stride=1,
-            extra_cl_radial_rings=6,
-            cl_extra_axial_layers=22,
-            interface_neck_refinement_gaps=0,
-            interface_neck_extra_rings_per_gap=0,
-        ),
-        "medium": medium,
-        "medium_coarse": spec(
-            "medium_coarse",
-            contact_line_nodes=8,
-            axial_ring_stride=1,
-            extra_cl_radial_rings=3,
-            cl_extra_axial_layers=8,
-            interface_neck_refinement_gaps=0,
-            interface_neck_extra_rings_per_gap=0,
-        ),
-        "coarse": spec(
-            "coarse",
-            contact_line_nodes=4,
-            axial_ring_stride=1,
-            extra_cl_radial_rings=2,
-            cl_extra_axial_layers=6,
-            interface_neck_refinement_gaps=0,
-            interface_neck_extra_rings_per_gap=0,
-        ),
-        "coarser": spec(
-            "coarser",
-            contact_line_nodes=4,
-            contact_line_radial_rings=2,
-            axial_ring_stride=1,
-            extra_cl_radial_rings=1,
-            cl_extra_axial_layers=3,
-            interface_neck_refinement_gaps=0,
-            interface_neck_extra_rings_per_gap=0,
-        ),
-    }
-
-
-def _mesh_spec_value(mesh_spec: dict | None, key: str, default):
-    if mesh_spec is not None and key in mesh_spec:
-        return mesh_spec[key]
-    return default
 
 
 def _separation_view_kwargs() -> dict[str, float]:
@@ -314,25 +204,20 @@ def _refinement_from_contact_line_nodes(n_nodes: int) -> int:
     return refinement
 
 
-def _replace_supported_config(base: sep.VolumetricPitoisConfig, **changes) -> sep.VolumetricPitoisConfig:
-    fields = getattr(base, "__dataclass_fields__", {})
-    return replace(base, **{key: value for key, value in changes.items() if key in fields})
-
-
-def initialshape_config(mesh_spec: dict | None = None) -> sep.VolumetricPitoisConfig:
+def initialshape_config() -> sep.VolumetricPitoisConfig:
     # Geometry is fixed from the Pitois 2000 PDF: R, D, V, and r_CL from Eq. [6].
     # Keep the restored relaxation/snapshot machinery, but override these values here.
-    return _replace_supported_config(
+    return replace(
         sep.separation_config(),
         name="Case_2b_initialshape",
         title="Case 2b: equilibrium initial shape",
         use_last_initialshape_msh=False,
-        refinement=_refinement_from_contact_line_nodes(_mesh_spec_value(mesh_spec, "contact_line_nodes", USER_CONTACT_LINE_NODES)),
-        contact_line_radial_rings=int(_mesh_spec_value(mesh_spec, "contact_line_radial_rings", USER_CONTACT_LINE_RADIAL_RINGS)),
-        extra_cl_radial_rings=int(_mesh_spec_value(mesh_spec, "extra_cl_radial_rings", USER_EXTRA_CL_RADIAL_RINGS)),
-        cl_extra_axial_layers=int(_mesh_spec_value(mesh_spec, "cl_extra_axial_layers", USER_CL_EXTRA_AXIAL_LAYERS)),
-        axial_ring_stride=int(_mesh_spec_value(mesh_spec, "axial_ring_stride", USER_SIDEWALL_AXIAL_RING_STRIDE)),
-        contact_line_radial_bias_ratio=float(_mesh_spec_value(mesh_spec, "cl_radial_bias_ratio", USER_CL_RADIAL_BIAS_RATIO)),
+        refinement=_refinement_from_contact_line_nodes(USER_CONTACT_LINE_NODES),
+        contact_line_radial_rings=int(USER_CONTACT_LINE_RADIAL_RINGS),
+        extra_cl_radial_rings=int(USER_EXTRA_CL_RADIAL_RINGS),
+        cl_extra_axial_layers=int(USER_CL_EXTRA_AXIAL_LAYERS),
+        axial_ring_stride=int(USER_SIDEWALL_AXIAL_RING_STRIDE),
+        contact_line_radial_bias_ratio=float(USER_CL_RADIAL_BIAS_RATIO),
         particle_radius=float(PDF_PARTICLE_RADIUS_M),
         target_cap_radius=float(PDF_CONTACT_LINE_RADIUS_M),
         initial_d_over_r=float(PDF_INITIAL_SEPARATION_D_M / max(PDF_PARTICLE_RADIUS_M, 1.0e-30)),
@@ -351,55 +236,7 @@ def initialshape_config(mesh_spec: dict | None = None) -> sep.VolumetricPitoisCo
         contact_angle_deg=USER_CONTACT_ANGLE_DEG,
         record_every=1,
         mesh_snapshot_every=1,
-        match_initial_force_to_fig5=False,
-        enable_ns_pressure_projection=False,
     )
-
-
-def _prepare_initialshape_state(
-    config: sep.VolumetricPitoisConfig,
-    mesh_spec: dict | None = None,
-) -> sep.VolumetricPitoisState:
-    neck_extra_layers = max(
-        0,
-        int(
-            _mesh_spec_value(
-                mesh_spec,
-                "interface_neck_extra_axial_layers",
-                USER_INTERFACE_NECK_EXTRA_AXIAL_LAYERS,
-            )
-        ),
-    )
-    if neck_extra_layers <= 0:
-        return sep._prepare_state(config)
-
-    original_builder = sep._build_structured_volumetric_catenoid
-
-    def build_with_neck_refinement(
-        refinement,
-        radial_ring_factors_override=None,
-        axial_ring_stride_override: int = 1,
-        neck_extra_axial_layers_override: int = 0,
-        contact_extra_axial_layers_override: int = 0,
-    ):
-        # ENFORCE NECK REFINEMENT ON ACTUAL HYPERCT MESH:
-        # insert real liquid-air interface layers before tetra connectivity exists.
-        return original_builder(
-            refinement,
-            radial_ring_factors_override=radial_ring_factors_override,
-            axial_ring_stride_override=axial_ring_stride_override,
-            neck_extra_axial_layers_override=max(
-                int(neck_extra_axial_layers_override),
-                neck_extra_layers,
-            ),
-            contact_extra_axial_layers_override=contact_extra_axial_layers_override,
-        )
-
-    sep._build_structured_volumetric_catenoid = build_with_neck_refinement
-    try:
-        return sep._prepare_state(config)
-    finally:
-        sep._build_structured_volumetric_catenoid = original_builder
 
 
 def _static_vertex_force(v, *, state: sep.VolumetricPitoisState) -> np.ndarray:
@@ -410,12 +247,6 @@ def _static_vertex_force(v, *, state: sep.VolumetricPitoisState) -> np.ndarray:
         HC=state.HC,
         pressure_model=lambda vv, HC=None, dim=3: sep._pressure_model(vv, HC=HC, dim=dim, state=state),
     )
-
-
-def _maybe_update_continuity_pressure_scalar(state: sep.VolumetricPitoisState, *, dt: float) -> None:
-    updater = getattr(sep, "_update_continuity_pressure_scalar", None)
-    if updater is not None:
-        updater(state, dt=float(dt))
 
 
 def _free_force_metrics(state: sep.VolumetricPitoisState) -> dict[str, np.ndarray | float]:
@@ -667,8 +498,6 @@ def _solve_pitois_eq3_half_profile(
         raise ValueError("USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO must be positive and finite.")
     unique_original = np.asarray(sorted({round(float(value), 15) for value in z_eval_used}), dtype=float)
     if unique_original.size >= 2:
-        # ENFORCE CL REFINEMENT ON ACTUAL HYPERCT MESH:
-        # CL-to-neck liquid-air interface radial gaps follow USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO.
         z_dense = np.linspace(0.0, z_cl, 5000, dtype=float)
         r_dense = np.asarray(best_sol.sol(z_dense)[0], dtype=float)
         r_dense = np.maximum.accumulate(np.clip(r_dense, 1.0e-8 * r_cl, r_cl))
@@ -944,7 +773,13 @@ def _orthonormal_basis(axis: np.ndarray, reference: np.ndarray | None = None) ->
 
 
 def _liquid_interface_vertex_rings(state: sep.VolumetricPitoisState) -> list[list]:
-    return [list(ring) for ring in state.outer_rings]
+    if len(state.layer_rings) > 2:
+        first_liquid_layer = 1
+        last_liquid_layer = len(state.layer_rings) - 2
+    else:
+        first_liquid_layer = 0
+        last_liquid_layer = len(state.layer_rings) - 1
+    return [list(ring) for ring in state.outer_rings[first_liquid_layer : last_liquid_layer + 1]]
 
 
 def _ordered_ring_array(
@@ -1066,7 +901,58 @@ def _interface_ring_arrays(state: sep.VolumetricPitoisState) -> list[np.ndarray]
     mid = 0.5 * (centers[0] + centers[-1])
     s_vals = np.asarray([(center - mid) @ axis for center in centers], dtype=float)
     order = np.argsort(s_vals)
-    return [ordered[int(idx)] for idx in order]
+    ordered = [ordered[int(idx)] for idx in order]
+    centers = centers[order]
+    s_vals = s_vals[order]
+    radii = np.asarray(
+        [_ring_radius_about_axis(ring, center, axis) for ring, center in zip(ordered, centers)],
+        dtype=float,
+    )
+    n_phi = min(len(ring) for ring in ordered)
+    if len(ordered) < 3 or n_phi < 3:
+        return [ring[:n_phi] for ring in ordered]
+
+    center_idx = int(np.argmin(np.abs(s_vals)))
+    neck_radius = max(float(radii[center_idx]), 1.0e-8 * float(state.config.target_cap_radius))
+    contact_radius = float(state.config.target_cap_radius)
+    angles = np.linspace(0.0, 2.0 * math.pi, n_phi, endpoint=False, dtype=float)
+
+    lower_indices = list(range(center_idx, -1, -1))
+    upper_indices = list(range(center_idx, len(ordered)))
+    lower_rings_center_to_cl = _resample_half_interface_rings(
+        n_layers=len(lower_indices),
+        sign=-1.0,
+        profile_radii=radii[lower_indices],
+        profile_s_abs=np.abs(s_vals[lower_indices]),
+        neck_radius=neck_radius,
+        contact_radius=contact_radius,
+        mid=mid,
+        axis=axis,
+        e1=e1,
+        e2=e2,
+        angles=angles,
+    )
+    upper_rings_center_to_cl = _resample_half_interface_rings(
+        n_layers=len(upper_indices),
+        sign=1.0,
+        profile_radii=radii[upper_indices],
+        profile_s_abs=np.abs(s_vals[upper_indices]),
+        neck_radius=neck_radius,
+        contact_radius=contact_radius,
+        mid=mid,
+        axis=axis,
+        e1=e1,
+        e2=e2,
+        angles=angles,
+    )
+
+    # Enforce USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO on the exported/rendered
+    # liquid-air interface: CL-to-neck radial gaps are smallest at the CL.
+    stage1_rings = list(reversed(lower_rings_center_to_cl)) + upper_rings_center_to_cl[1:]
+
+    # Second-stage neck refinement: add extra rings in the bridge waist region
+    # after the 1.1 radial distribution, so the neck gets more actual mesh nodes.
+    return _add_neck_refinement_rings(stage1_rings, center_idx=len(lower_rings_center_to_cl) - 1)
 
 
 def _ring_array_segments(rings: list[np.ndarray]) -> np.ndarray:
@@ -1316,75 +1202,6 @@ def _render_equilibrium_history_figures(history: list[dict], out_dir: Path, *, d
     return paths
 
 
-def _generate_one_mesh_level(mesh_spec: dict[str, int | float | str]) -> dict[str, int | float | str]:
-    name = str(mesh_spec["name"])
-    out_dir = OUT_ROOT / "mesh_sets" / name
-    fig_dir = out_dir / "fig"
-    result_dir = out_dir / "results"
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.mkdir(parents=True, exist_ok=True)
-
-    config = initialshape_config(mesh_spec)
-    state = _prepare_initialshape_state(config, mesh_spec)
-    for v in state.HC.V:
-        v.u = np.zeros(3, dtype=float)
-
-    volume = _match_initial_hyperct_msh_volume(state)
-    sep._update_duals_and_masses(state)
-    sep._update_pressure_scalar(state)
-
-    _save_interface_snapshot(
-        state,
-        f"{config.title}: {name} HyperCT mesh",
-        fig_dir / "mesh_initial.png",
-    )
-    points, tets, _node_ids = sep._snapshot_msh_indexed_mesh(state)
-
-    summary = {
-        "name": name,
-        "mesh_generator": "HyperCT",
-        "msh_format": "Gmsh v2 tetra export only",
-        "particle_radius_mm": float(PDF_PARTICLE_RADIUS_M * 1.0e3),
-        "initial_D_um": float(PDF_INITIAL_SEPARATION_D_M * 1.0e6),
-        "target_volume_ul": float(PDF_BRIDGE_VOLUME_M3 * 1.0e9),
-        "sum_abs_tetra_volume_ul": float(volume * 1.0e9),
-        "nodes": int(points.shape[0]),
-        "tetrahedra": int(tets.shape[0]),
-        "contact_line_nodes": int(config.refinement and len(state.outer_rings[0]) or len(state.outer_rings[0])),
-        "contact_line_radial_rings": int(config.contact_line_radial_rings),
-        "extra_cl_radial_rings": int(config.extra_cl_radial_rings),
-        "cl_extra_axial_layers": int(config.cl_extra_axial_layers),
-        "cl_radial_bias_ratio": float(config.contact_line_radial_bias_ratio),
-        "interface_radial_distribution_ratio": float(USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO),
-        "interface_neck_extra_axial_layers": int(mesh_spec["interface_neck_extra_axial_layers"]),
-        "outer_interface_rings": int(len(state.outer_rings)),
-        "png": str(fig_dir / "mesh_initial.png"),
-        "msh": str(fig_dir / "mesh_initial.msh"),
-    }
-    _write_json(result_dir / "mesh_summary.json", summary)
-    return summary
-
-
-def _generate_mesh_level_sets() -> list[dict[str, int | float | str]]:
-    specs = _mesh_level_specs()
-    summaries = []
-    for name in USER_MESH_LEVEL_ORDER:
-        if name not in specs:
-            raise KeyError(f"Unknown mesh level {name!r}.")
-        print(f"[mesh set] building {name}", flush=True)
-        summary = _generate_one_mesh_level(specs[name])
-        summaries.append(summary)
-        print(
-            "[mesh set] "
-            f"{name}: nodes={summary['nodes']} tet={summary['tetrahedra']} "
-            f"volume={summary['sum_abs_tetra_volume_ul']:.9f} uL",
-            flush=True,
-        )
-
-    _write_json(OUT_ROOT / "mesh_sets" / "mesh_set_summary.json", summaries)
-    return summaries
-
-
 def _save_relaxation_snapshot(
     state: sep.VolumetricPitoisState,
     *,
@@ -1438,7 +1255,6 @@ def _summary_payload(
             "interface_radial_distribution_ratio": float(USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO),
             "interface_neck_refinement_gaps": int(USER_INTERFACE_NECK_REFINEMENT_GAPS),
             "interface_neck_extra_rings_per_gap": int(USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP),
-            "interface_neck_extra_axial_layers": int(USER_INTERFACE_NECK_EXTRA_AXIAL_LAYERS),
         },
         "pitois_eq3_initial_profile": dict(getattr(state, "pitois_eq3_initial_profile", {})),
         "initial_metrics": {
@@ -1478,13 +1294,13 @@ def _relax_initial_shape(
     if initial_metrics is None:
         sep._update_duals_and_masses(state)
         sep._update_pressure_scalar(state)
-        _maybe_update_continuity_pressure_scalar(state, dt=working_dt)
+        sep._update_continuity_pressure_scalar(state, dt=working_dt)
         if USER_UNPIN_CONTACT_LINE:
             sep._update_moving_contact_line(state, dt=None)
             _set_target_msh_volume_metadata(state)
             sep._update_duals_and_masses(state)
             sep._update_pressure_scalar(state)
-            _maybe_update_continuity_pressure_scalar(state, dt=working_dt)
+            sep._update_continuity_pressure_scalar(state, dt=working_dt)
         else:
             _set_target_msh_volume_metadata(state)
         _solve_total_force_balance_pressure(state)
@@ -1521,7 +1337,7 @@ def _relax_initial_shape(
 
             sep._update_duals_and_masses(state)
             sep._update_pressure_scalar(state)
-            _maybe_update_continuity_pressure_scalar(state, dt=dt_step)
+            sep._update_continuity_pressure_scalar(state, dt=dt_step)
             symplectic_euler(
                 state.HC,
                 state.bV_caps,
@@ -1566,7 +1382,7 @@ def _relax_initial_shape(
         if history_due or pressure_balance_due:
             sep._update_duals_and_masses(state)
             sep._update_pressure_scalar(state)
-            _maybe_update_continuity_pressure_scalar(state, dt=dt_step)
+            sep._update_continuity_pressure_scalar(state, dt=dt_step)
         if pressure_balance_due:
             _solve_total_force_balance_pressure(state)
         row = _history_row(state, step=step, time_s=sim_time_s) if history_due else None
@@ -1611,7 +1427,7 @@ def _relax_initial_shape(
     _correct_current_hyperct_msh_volume(state)
     sep._update_duals_and_masses(state)
     sep._update_pressure_scalar(state)
-    _maybe_update_continuity_pressure_scalar(state, dt=working_dt)
+    sep._update_continuity_pressure_scalar(state, dt=working_dt)
     _solve_total_force_balance_pressure(state)
     final_row = _history_row(state, step=int(history[-1]["step"]) if history else 0, time_s=sim_time_s)
     if history and int(history[-1]["step"]) == int(final_row["step"]) and abs(float(history[-1]["time_s"]) - float(final_row["time_s"])) <= 1.0e-30:
@@ -1634,22 +1450,8 @@ def _relax_initial_shape(
 def main() -> None:
     _install_initialshape_export_order()
     _install_initialshape_safe_move()
-    if bool(USER_GENERATE_MESH_LEVEL_SETS):
-        summaries = _generate_mesh_level_sets()
-        print("=" * 72)
-        print("  Case 2b HyperCT mesh level sets")
-        print("=" * 72)
-        for row in summaries:
-            print(
-                f"{row['name']:>13s}: "
-                f"nodes={row['nodes']}, tet={row['tetrahedra']}, "
-                f"volume={row['sum_abs_tetra_volume_ul']:.9f} uL"
-            )
-        print(f"Saved mesh set summary    = {OUT_ROOT / 'mesh_sets' / 'mesh_set_summary.json'}")
-        return
-
     config = initialshape_config()
-    state = _prepare_initialshape_state(config)
+    state = sep._prepare_state(config)
 
     out_dir = OUT_ROOT
     fig_dir = out_dir / "fig"
@@ -1668,13 +1470,13 @@ def main() -> None:
     )
     sep._update_duals_and_masses(state)
     sep._update_pressure_scalar(state)
-    _maybe_update_continuity_pressure_scalar(state, dt=float(state.config.dt))
+    sep._update_continuity_pressure_scalar(state, dt=float(state.config.dt))
     if USER_UNPIN_CONTACT_LINE:
         sep._update_moving_contact_line(state, dt=None)
         _set_target_msh_volume_metadata(state)
         sep._update_duals_and_masses(state)
         sep._update_pressure_scalar(state)
-        _maybe_update_continuity_pressure_scalar(state, dt=float(state.config.dt))
+        sep._update_continuity_pressure_scalar(state, dt=float(state.config.dt))
     _solve_total_force_balance_pressure(state)
     initial_metrics = _free_force_metrics(state)
     print(
@@ -1734,7 +1536,6 @@ def main() -> None:
     print(f"Interface radial ratio    = {USER_INTERFACE_RADIAL_DISTRIBUTION_RATIO:.6g}")
     print(f"Neck refine gaps          = {USER_INTERFACE_NECK_REFINEMENT_GAPS}")
     print(f"Neck extra rings/gap      = {USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP}")
-    print(f"Neck extra axial layers   = {USER_INTERFACE_NECK_EXTRA_AXIAL_LAYERS}")
     print(f"Sidewall axial stride     = {config.axial_ring_stride}")
     print(f"Sidewall axial layers     = {len(state.outer_rings)}")
     if total_cl_rings <= 1 and abs(float(config.contact_line_radial_bias_ratio) - 1.0) > 1.0e-12:

@@ -1,20 +1,23 @@
-"""Case 2b axisym: Gmsh-mesh Pitois-2000 Fig. 5 separation case.
+"""Case 2b axisym: fully axisymmetric Pitois-2000 Fig. 5 separation case.
 
-This case keeps the Pitois separation solver path from
-``Case_2b_axisym_pitois2000_separation.py`` but initializes the compute mesh
-directly from the hard-coded Gmsh ``mesh_iter0012.msh`` file.
+This rebuilds the deleted Case 2b source in a compact form:
 
-1. Load the Gmsh volume/surface mesh as the compute mesh.
-2. Move only the top and bottom cap interiors with prescribed velocities.
-3. Leave the contact-line rings free so they can slide on the spheres.
-4. Compute axial bridge force through the volumetric stress path and write the
-   same separation history, CSV, MSH, and PNG outputs as the base case.
+1. Reuse the volumetric catenoid-like bridge mesh from the equilibrium
+   benchmark.
+2. Move only the top and bottom cap boundaries with prescribed velocities.
+3. Compute axial bridge force through the built-in volumetric
+   ``multiphase_stress.py`` path.
+4. Use a one-fixed-one-moving sphere motion, matching the Fig. 5 apparatus
+   interpretation used here, and write separation-only history JSON and mesh
+   PNG snapshots under
+   ``case_2b_axisym/out/Case_2b_axisym``.
 
 Important limitation:
-    This case now uses a sparse tetrahedral velocity-pressure projection for
-    incompressibility. The capillary pressure driving the force balance is
-    still an axisymmetric Laplace-pressure surrogate built from the evolving
-    outer bridge profile.
+    This case does not solve a full volumetric pressure field. Instead it uses
+    an axisymmetric Laplace-pressure surrogate built from the evolving outer
+    bridge profile. That keeps the force scale much closer to the Pitois
+    separation data than the old surface-only surrogate, while still remaining
+    an intermediate validation step.
 
 Contact-angle note:
     The Pitois 2000 Fig. 5 setup in this script uses a baseline modeling
@@ -37,10 +40,9 @@ import argparse
 import csv
 from dataclasses import asdict, dataclass, field, replace
 import json
-import math
 import os
 from pathlib import Path
-import shutil
+import re
 import sys
 from types import SimpleNamespace
 import warnings
@@ -61,14 +63,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter, NullFormatter
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 import numpy as np
-
-try:
-    from scipy.sparse import coo_matrix, diags
-    from scipy.sparse.linalg import spsolve
-except Exception:  # pragma: no cover - only used when scipy is unavailable.
-    coo_matrix = None
-    diags = None
-    spsolve = None
+from hyperct import Complex
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -78,76 +73,22 @@ if str(REPO_ROOT) not in sys.path:
 from cases_dynamic.liquid_bridge_equilibrium.Case_5_volumetric_stress_equilibrium_particle_particle_bridge_benchmark import (
     HEX_TETS,
     PRISM_TETS,
+    _build_structured_volumetric_catenoid,
+    _build_surface_complex_from_template,
+    _extract_triangles,
+    _render_surface_geometry_with_caps,
 )
+from ddgclib._curvatures_heron import hndA_i_interface
 from ddgclib.dynamic_integrators import symplectic_euler
 from ddgclib.dynamic_integrators._integrators_dynamic import _move, _recompute_duals
 from ddgclib.operators.multiphase_stress import multiphase_stress_force
-from ddgclib.operators.surface_tension import dual_area_heron, surface_tension_force
+from ddgclib.operators.surface_tension import surface_tension_force
 from ddgclib.operators.stress import cauchy_stress, dual_area_vector, dual_volume, velocity_difference_tensor_pointwise
 
 
-class _DisplayVertex:
-    def __init__(self, coords):
-        self.x_a = np.asarray(coords, dtype=float)
-        self.nn: set[object] = set()
-        self.boundary = False
-
-    def connect(self, other) -> None:
-        self.nn.add(other)
-        other.nn.add(self)
-
-
-class _DisplayVertexStore(dict):
-    def __init__(self):
-        super().__init__()
-        self._key_by_vertex_id: dict[int, tuple[float, float, float]] = {}
-
-    def __setitem__(self, key, vertex):
-        old_vertex = self.get(key)
-        if old_vertex is not None and old_vertex is not vertex:
-            self._key_by_vertex_id.pop(id(old_vertex), None)
-        super().__setitem__(key, vertex)
-        self._key_by_vertex_id[id(vertex)] = key
-
-    def __delitem__(self, key):
-        old_vertex = self.get(key)
-        if old_vertex is not None:
-            self._key_by_vertex_id.pop(id(old_vertex), None)
-        super().__delitem__(key)
-
-    def clear(self):
-        self._key_by_vertex_id.clear()
-        super().clear()
-
-    def __missing__(self, key):
-        vertex = _DisplayVertex(key)
-        self[key] = vertex
-        return vertex
-
-    def __iter__(self):
-        return iter(self.values())
-
-    def move(self, vertex, pos):
-        old_key = self._key_by_vertex_id.get(id(vertex))
-        if old_key is not None and self.get(old_key) is vertex:
-            del self[old_key]
-        else:
-            for key, value in list(self.items()):
-                if value is vertex:
-                    del self[key]
-                    break
-        vertex.x_a = np.asarray(pos, dtype=float)
-        self[tuple(float(x) for x in vertex.x_a[:3])] = vertex
-
-
-class Complex:
-    def __init__(self, _dim: int, domain=None):
-        self.domain = domain
-        self.V = _DisplayVertexStore()
-
-
-OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_axisym_pitois2000_separation_Gmsh"
-HARDCODED_INITIAL_MSH_PATH = (
+OUT_ROOT = Path(__file__).resolve().parents[1] / Path(__file__).stem
+INITIALSHAPE_OUT_ROOT = Path(__file__).resolve().parent / "out" / "Case_2b_axisym_initialshape"
+INITIAL_MSH_PATH = (
     Path(__file__).resolve().parent
     / "out"
     / "Case_2b_axisym_initialshape_Gmsh"
@@ -155,21 +96,13 @@ HARDCODED_INITIAL_MSH_PATH = (
     / "mesh_iter0012.msh"
 )
 
-
-def _required_initial_msh_path() -> Path:
-    path = HARDCODED_INITIAL_MSH_PATH
-    if path.name != "mesh_iter0012.msh":
-        raise RuntimeError(f"Initial mesh must be mesh_iter0012.msh, got {path}")
-    if not path.is_file():
-        raise FileNotFoundError(f"Required initial Gmsh mesh not found: {path}")
-    return path
-
 # ---------------------------------------------------------------------------
 # USER CONTROLS
 # Edit these values at the top of the file when you want to change the
 # separation run or open an interactive viewer without touching the code below.
 # ---------------------------------------------------------------------------
 USER_REFINEMENT = 1
+USER_USE_LAST_INITIALSHAPE_MSH = True
 # Exact number of radial rings used near the contact line.
 USER_CONTACT_LINE_RADIAL_RINGS = 2
 # Additional outer-band rings near the contact line. Keep this consistent with
@@ -182,30 +115,16 @@ USER_NECK_EXTRA_AXIAL_LAYERS = 12
 USER_CL_EXTRA_AXIAL_LAYERS = 6
 # Radial gap ratio. Larger r is finer; adjacent gap ratio is 1.1.
 USER_CL_RADIAL_BIAS_RATIO = 1.1
-# Max separation iterations. Keep at 1 for the requested smoke check; increase
-# here when you want a longer Fig. 5 sweep.
-USER_TOTAL_STEPS = 12000
-# Time-step rule:
-#   USER_DT_S > 0: fixed user step.
-#   USER_DT_S < 0: physical step, dt = min(dt_CL, dt_capillary, dt_mesh).
-# This keeps the automatic step computed from numerical/physical limits only.
-USER_DT_S = 0.001
-USER_TARGET_SWEEP_TIME_S = abs(USER_DT_S) * max(1, USER_TOTAL_STEPS)
-USER_ENABLE_ADAPTIVE_DT = USER_DT_S < 0.0
-# Negative means no artificial ceiling; the selected value is the right_dt
-# physical minimum. Positive USER_DT_S remains the fixed step.
-USER_ADAPTIVE_DT_MAX_S = -1.0 if USER_DT_S < 0.0 else USER_DT_S
-# Do not let a user floor override the physical capillary/mesh/contact-line
-# limit. The selector only keeps a tiny numerical guard against exactly zero.
-USER_ADAPTIVE_DT_MIN_S = 0.0
+USER_DT_S = 0.03
+USER_TOTAL_STEPS = 10
+USER_ENABLE_ADAPTIVE_DT = True
+USER_ADAPTIVE_DT_MAX_S = USER_DT_S
+USER_ADAPTIVE_DT_MIN_S = 1.0e-5
 USER_ADAPTIVE_DT_CAPILLARY_SAFETY = 0.25
 USER_ADAPTIVE_DT_MESH_DISPLACEMENT_FRAC = 0.15
 
-USER_RECORD_EVERY_STEPS = 100
-USER_MESH_SNAPSHOT_EVERY_STEPS = 100
-# The imported t=0 geometry is calibrated to the Fig. 5 setup.  Do not use the
-# first near-start row as independent dynamic validation in the comparison plot.
-USER_FIG5_COMPARE_SKIP_INITIAL_STEPS = 1
+USER_RECORD_EVERY_STEPS = 1
+USER_MESH_SNAPSHOT_EVERY_STEPS = 5
 # Preferred minimum axis-window width in mm. The renderer will automatically
 # expand beyond this if the actual mesh/sphere geometry is larger.
 USER_X_AXIS_MIN_MM = -1
@@ -227,9 +146,9 @@ USER_SHOW_SIDE_TRIANGLE_DIAGONALS = True
 # want a Fig. 1-style section view instead of the full 3D graph.
 USER_REAL_TRIANGLE_VIEW = "full"
 USER_SHOW_CONTACT_RING_OVERLAY = False
-USER_SHOW_SURFACE_OVERLAY = False
+USER_SHOW_SURFACE_OVERLAY = True
 USER_SURFACE_OVERLAY_ALPHA = 0.58
-USER_MESH_VERTEX_SIZE = 5.0
+USER_MESH_VERTEX_SIZE = 18.0
 USER_WIREFRAME_MERIDIANS = 24
 USER_MESH_ALPHA = 0.99
 USER_CAP_EDGE_ALPHA = 0.0
@@ -238,36 +157,10 @@ USER_INCLUDE_GRAVITY = True
 USER_GRAVITY_MPS2 = 9.81
 USER_INTEGRATION_SUBSTEPS = 1
 USER_CONTACT_RADIUS_SAMPLES = 128
-# Gmsh path: use a discrete incompressible velocity projection on the loaded
-# tetrahedral mesh instead of the old scalar Fp,proj volume-force controller.
-# The projection includes one global volume-constraint row,
-# grad(V) dot u = (V_target - V_current) / dt, so long runs do not drift.
-USER_ENABLE_INCOMPRESSIBLE_PROJECTION = True
-USER_INCOMPRESSIBLE_PROJECTION_REGULARIZATION = 1.0e-12
-USER_ENABLE_VOLUME_PROJECTION = False
+USER_ENABLE_VOLUME_PROJECTION = True
 USER_ENABLE_PRESSURE_TRIAL_REFINEMENT = True
-USER_VOLUME_PROJECTION_MAX_ITERS = 12
+USER_VOLUME_PROJECTION_MAX_ITERS = 6
 USER_VOLUME_PROJECTION_REL_TOL = 1.0e-6
-USER_CLAMP_INTERFACE_TO_CONTACT_SPAN = True
-USER_CLAMP_INTERFACE_RADIUS_TO_CONTACT = True
-USER_PRESERVE_INTERFACE_AXIAL_ORDER = True
-USER_ENABLE_POSITION_VOLUME_CONSTRAINT = True
-USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL = 1.0e-5
-USER_POSITION_VOLUME_CONSTRAINT_MAX_ITERS = 8
-USER_ENABLE_CONTACT_LINE_VOLUME_SLIDE = True
-USER_CONTACT_LINE_VOLUME_SLIDE_TRIGGER_REL = 5.0e-5
-USER_CONTACT_LINE_VOLUME_SLIDE_MIN_RADIUS_FRACTION = 0.15
-USER_CONTACT_LINE_VOLUME_SLIDE_MAX_RADIUS_FRACTION = 1.05
-USER_STOP_ON_NUMERICAL_RUPTURE = True
-USER_NUMERICAL_RUPTURE_VOLUME_REL_ERROR = 2.0e-2
-USER_MAX_ACCELERATION = 5.0e-3
-USER_ABORT_ON_NONFINITE_STATE = True
-USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION = False
-USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL = 5.0e-3
-USER_MAX_VOLUME_REL_ERROR_FOR_ABORT = 0.25
-# Eq. 3 pressure is evaluated from a local quadratic neck fit.  The single
-# waist ring is excluded because its discrete cusp otherwise dominates d2r/dz2.
-USER_PRESSURE_NECK_FIT_SIDE_RINGS = 2
 USER_ALLOW_CONTACT_LINE_GROWTH = True
 USER_ENABLE_DYNAMIC_CONTACT_ANGLE = True
 USER_DYNAMIC_CONTACT_ANGLE_MAX_DEG = 25.0
@@ -291,41 +184,12 @@ USER_INTERACTIVE_ELEV_DEG =  25.0 #0#
 USER_INTERACTIVE_AZIM_DEG =  45.0 #-87#
 
 
-def _pitois_eq6_wetted_radius(
-    *,
-    particle_radius_m: float,
-    bridge_volume_m3: float,
-    initial_d_over_r: float,
-) -> float:
-    """Compute the wetted/contact radius b from Pitois et al. Eq. [6].
-
-    Source: Pitois, Moucheront, Chateau, J. Colloid Interface Sci. 231
-    (2000), Fig. 5 and Eq. [6].  Fig. 5 gives the experiment as a bridge of
-    liquid 2 with volume V = 1.1 mm^3 between ruby spheres of radius R = 4 mm.
-    The paper does not give a separate fixed contact radius.  Eq. [6] gives
-    the cylindrical/flat-profile bridge volume
-
-        V = (pi R / 2) * (H(b)^2 - D^2),  H(b) = D + b^2 / R,
-
-    so the contact/wetted radius b is computed from R, V, and the starting
-    separation D = (D/R)R.  With this Case_2b starting D/R this gives
-    b = 1.207424315572 mm; using the first digitized Fig. 5 point gives
-    b = 1.207887812431 mm.
-    """
-    radius = float(particle_radius_m)
-    volume = float(bridge_volume_m3)
-    gap = float(initial_d_over_r) * radius
-    if radius <= 0.0 or volume <= 0.0:
-        raise ValueError("Pitois Eq. [6] needs positive particle radius and bridge volume.")
-    height_at_contact = math.sqrt(gap * gap + 2.0 * volume / (math.pi * radius))
-    return math.sqrt(max(radius * (height_at_contact - gap), 0.0))
-
-
 @dataclass(frozen=True)
 class VolumetricPitoisConfig:
     name: str
     title: str
     refinement: int = USER_REFINEMENT
+    use_last_initialshape_msh: bool = USER_USE_LAST_INITIALSHAPE_MSH
     contact_line_radial_rings: int = USER_CONTACT_LINE_RADIAL_RINGS
     extra_cl_radial_rings: int = USER_EXTRA_CL_RADIAL_RINGS
     axial_ring_stride: int = USER_SIDEWALL_AXIAL_RING_STRIDE
@@ -333,16 +197,9 @@ class VolumetricPitoisConfig:
     cl_extra_axial_layers: int = USER_CL_EXTRA_AXIAL_LAYERS
     contact_line_radial_bias_ratio: float = USER_CL_RADIAL_BIAS_RATIO
     particle_radius: float = 4.0e-3
-    # Starting normalized surface gap. This is the existing Case_2b start value,
-    # close to the first digitized Fig. 5 point D/R = 0.014403481854782.
+    target_cap_radius: float = 1.54e-3
     initial_d_over_r: float = 0.014484537138212631
-    # Pitois Fig. 5 bridge volume: V = 1.1 mm^3 = 1.10e-9 m^3.
     initial_bridge_volume_m3: float = 1.10e-9
-    # Pitois Fig. 5 gives R, V, and D/R, not a contact radius directly.
-    # Therefore the default target_cap_radius is not a hard-coded 1.54 mm value;
-    # it is computed as the wetted radius b from Pitois Eq. [6].
-    use_pitois_eq6_contact_radius: bool = True
-    target_cap_radius: float = 0.0
     initial_neck_radius_ratio: float = USER_INITIAL_NECK_RADIUS_RATIO
     enable_initial_relaxation: bool = USER_ENABLE_INITIAL_RELAXATION
     initial_relax_steps: int = USER_INITIAL_RELAX_STEPS
@@ -361,7 +218,7 @@ class VolumetricPitoisConfig:
     n_steps: int = USER_TOTAL_STEPS
     cap_speed: float = 5.0e-6
     damping: float = 2.0e-1
-    max_acceleration: float = USER_MAX_ACCELERATION
+    max_acceleration: float = 5.0e-3
     integration_substeps: int = USER_INTEGRATION_SUBSTEPS
     record_every: int = USER_RECORD_EVERY_STEPS
     mesh_snapshot_every: int = USER_MESH_SNAPSHOT_EVERY_STEPS
@@ -371,15 +228,9 @@ class VolumetricPitoisConfig:
     include_gravity: bool = USER_INCLUDE_GRAVITY
     gravity_mps2: float = USER_GRAVITY_MPS2
     contact_radius_samples: int = USER_CONTACT_RADIUS_SAMPLES
-    enable_incompressible_projection: bool = USER_ENABLE_INCOMPRESSIBLE_PROJECTION
-    incompressible_projection_regularization: float = USER_INCOMPRESSIBLE_PROJECTION_REGULARIZATION
     enable_volume_projection: bool = USER_ENABLE_VOLUME_PROJECTION
     volume_projection_max_iters: int = USER_VOLUME_PROJECTION_MAX_ITERS
     volume_projection_rel_tol: float = USER_VOLUME_PROJECTION_REL_TOL
-    enable_gmsh_geometric_volume_correction: bool = USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION
-    gmsh_geometric_volume_correction_trigger_rel: float = USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL
-    max_volume_rel_error_for_abort: float = USER_MAX_VOLUME_REL_ERROR_FOR_ABORT
-    pressure_neck_fit_side_rings: int = USER_PRESSURE_NECK_FIT_SIDE_RINGS
     allow_contact_line_growth: bool = USER_ALLOW_CONTACT_LINE_GROWTH
     enable_dynamic_contact_angle: bool = USER_ENABLE_DYNAMIC_CONTACT_ANGLE
     dynamic_contact_angle_max_deg: float = USER_DYNAMIC_CONTACT_ANGLE_MAX_DEG
@@ -398,20 +249,6 @@ class VolumetricPitoisConfig:
     @property
     def relative_speed(self) -> float:
         return self.cap_speed
-
-    def __post_init__(self) -> None:
-        if bool(self.use_pitois_eq6_contact_radius):
-            object.__setattr__(
-                self,
-                "target_cap_radius",
-                _pitois_eq6_wetted_radius(
-                    particle_radius_m=self.particle_radius,
-                    bridge_volume_m3=self.initial_bridge_volume_m3,
-                    initial_d_over_r=self.initial_d_over_r,
-                ),
-            )
-        if float(self.target_cap_radius) <= 0.0:
-            raise ValueError("target_cap_radius must be positive.")
 
 
 @dataclass
@@ -445,9 +282,6 @@ class VolumetricPitoisState:
     pressure_projection_scalar: float = 0.0
     pressure_projection_area_map: dict[int, float] = field(default_factory=dict)
     pressure_projection_normal_map: dict[int, np.ndarray] = field(default_factory=dict)
-    incompressible_projection_pressure: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
-    incompressible_divergence_before_l2: float = 0.0
-    incompressible_divergence_after_l2: float = 0.0
     elapsed_time_s: float = 0.0
     last_step_dt: float = USER_DT_S
     last_bottom_contact_line_speed: float = 0.0
@@ -521,11 +355,6 @@ def _volume_export_vertex_order(state: VolumetricPitoisState) -> list:
 
 def _assert_fixed_topology(state: VolumetricPitoisState) -> None:
     if not bool(getattr(state, "topology_frozen", False)):
-        return
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        current_volume_export_ids = tuple(id(vertex) for vertex in state.volume_export_vertices)
-        if current_volume_export_ids != state.frozen_volume_vertex_id_order:
-            raise RuntimeError("Fixed topology violated: Gmsh volume vertex IDs changed during time stepping")
         return
     if _layer_ring_id_structure(state) != state.frozen_layer_ring_id_structure:
         raise RuntimeError("Fixed topology violated: layer ring order/connectivity changed during time stepping")
@@ -653,12 +482,6 @@ def _freeze_volume_msh_topology(state: VolumetricPitoisState) -> None:
 def _freeze_surface_topology(state: VolumetricPitoisState) -> None:
     if bool(getattr(state, "topology_frozen", False)):
         _assert_fixed_topology(state)
-        return
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        state.frozen_layer_ring_id_structure = _layer_ring_id_structure(state)
-        state.frozen_surface_vertex_id_order = tuple(id(vertex) for vertex in state.surface_export_vertices)
-        state.frozen_volume_vertex_id_order = tuple(id(vertex) for vertex in state.volume_export_vertices)
-        state.topology_frozen = True
         return
     _ensure_surface_export_node_ids(state)
     _freeze_volume_msh_topology(state)
@@ -936,16 +759,12 @@ def _redistribute_sidewall_layers_axially(
 
 def separation_config() -> VolumetricPitoisConfig:
     return VolumetricPitoisConfig(
-        name="Case_2b_axisym_pitois2000_separation_Gmsh",
+        name="Case_2b_axisym_volumetric_separation",
         title="Case 2b axisym: volumetric pre-bridged separation",
     )
 
 
 def _mesh_volume_m3(HC) -> float:
-    if hasattr(HC, "gmsh_volume_vertices") and hasattr(HC, "gmsh_volume_tets"):
-        vertices = list(getattr(HC, "gmsh_volume_vertices"))
-        points = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-        return float(_indexed_tet_mesh_volume_m3(points, np.asarray(getattr(HC, "gmsh_volume_tets"), dtype=int)))
     return float(sum(float(dual_volume(v, HC, dim=3)) for v in HC.V))
 
 
@@ -976,7 +795,7 @@ def _move_vertices_batch(vertices, targets, HC, bV) -> None:
 
     Some ring updates are permutations: a vertex can be moved onto another
     vertex's current coordinates before that second vertex is moved. Doing
-    those updates one-by-one causes the vertex cache to evict the later vertex from
+    those updates one-by-one causes ``hyperct`` to evict the later vertex from
     the cache. A temporary staging move avoids that failure mode.
     """
     vertices = list(vertices)
@@ -985,14 +804,6 @@ def _move_vertices_batch(vertices, targets, HC, bV) -> None:
         return
     if len(vertices) != len(targets):
         raise ValueError("vertices and targets must have the same length")
-    if isinstance(getattr(HC, "V", None), _DisplayVertexStore) and len(vertices) >= 128:
-        all_vertices = list(HC.V.values())
-        for v, target in zip(vertices, targets):
-            v.x_a = np.asarray(target, dtype=float)
-        HC.V.clear()
-        for v in all_vertices:
-            HC.V[tuple(float(x) for x in np.asarray(v.x_a[:3], dtype=float))] = v
-        return
     if len(vertices) == 1:
         _move(vertices[0], targets[0], HC, bV)
         return
@@ -1066,62 +877,19 @@ def _cached_dual_area_vector(v, v_j, *, state: VolumetricPitoisState, dim: int) 
     return A_ij
 
 
-def _gmsh_surface_heron_force_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
-    cached = getattr(state, "_gmsh_surface_heron_force_cache", None)
-    if cached is not None:
-        return cached
-
-    side_tris = np.asarray(getattr(state, "surface_export_side_tris", np.empty((0, 3), dtype=int)), dtype=int)
-    surface_vertices = list(getattr(state, "surface_export_vertices", []))
-    if side_tris.size == 0 or not surface_vertices:
-        state._gmsh_surface_heron_force_cache = {}
-        return state._gmsh_surface_heron_force_cache
-
-    used_indices = sorted({int(idx) for tri in side_tris for idx in tri})
-    surface_clone = Complex(3, domain=None)
-    clone_by_idx = {
-        idx: surface_clone.V[tuple(float(x) for x in np.asarray(surface_vertices[idx].x_a[:3], dtype=float))]
-        for idx in used_indices
-    }
-    for tri in side_tris:
-        a, b, c = [int(idx) for idx in tri]
-        clone_by_idx[a].connect(clone_by_idx[b])
-        clone_by_idx[b].connect(clone_by_idx[c])
-        clone_by_idx[c].connect(clone_by_idx[a])
-
-    contact_ids = {id(v) for v in state.bottom_contact_ring + state.top_contact_ring}
-    for idx, surface_v in clone_by_idx.items():
-        source_v = surface_vertices[idx]
-        surface_v.boundary = id(source_v) in contact_ids
-        surface_v.u = np.zeros(3, dtype=float)
-        surface_v.p = 0.0
-        surface_v.m = max(float(dual_area_heron(surface_v)), 1.0e-12)
-        surface_v.phase = 0
-        surface_v.is_interface = not surface_v.boundary
-        surface_v.interface_phases = frozenset({0, 1}) if surface_v.is_interface else frozenset()
-
-    force_map = {
-        id(surface_vertices[idx]): surface_tension_force(surface_v, gamma=state.config.gamma, dim=3)
-        for idx, surface_v in clone_by_idx.items()
-    }
-    state._gmsh_surface_heron_force_cache = force_map
-    return force_map
-
-
-def _surface_tension_force_heron(v, *, dim: int, state: VolumetricPitoisState) -> np.ndarray:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        force = _gmsh_surface_heron_force_map(state).get(id(v))
-        if force is None:
-            return np.zeros(dim)
-        return np.asarray(force[:dim], dtype=float)
-    if getattr(v, "is_interface", False) and state.mps is not None:
-        phases = getattr(v, "interface_phases", frozenset())
-        if len(phases) >= 2:
-            phase_list = sorted(phases)
-            gamma = state.mps.get_gamma_pair(phase_list[0], phase_list[1])
-            if gamma != 0.0:
-                return surface_tension_force(v, gamma=gamma, dim=dim)
-    return np.zeros(dim)
+def _interface_surface_tension_cached(v, *, dim: int, mps) -> np.ndarray:
+    interface_nbs = {nb for nb in v.nn if getattr(nb, "is_interface", False)}
+    if len(interface_nbs) < 2:
+        return np.zeros(dim)
+    phases = getattr(v, "interface_phases", frozenset())
+    if len(phases) < 2:
+        return np.zeros(dim)
+    phase_list = sorted(phases)
+    gamma = mps.get_gamma_pair(phase_list[0], phase_list[1])
+    if gamma == 0.0:
+        return np.zeros(dim)
+    HNdA, _ = hndA_i_interface(v, interface_nbs | {v})
+    return -gamma * HNdA[:dim]
 
 
 def _multiphase_stress_force_cached(
@@ -1151,7 +919,8 @@ def _multiphase_stress_force_cached(
                 continue
             d_hat = d_ij / d_norm
             F += (mu / d_norm) * delta_u * np.dot(d_hat, A_ij)
-    F += _surface_tension_force_heron(v, dim=dim, state=state)
+    if getattr(v, "is_interface", False) and state.mps is not None:
+        F += _interface_surface_tension_cached(v, dim=dim, mps=state.mps)
     return F
 
 
@@ -1182,78 +951,14 @@ def _axisymmetric_profile(state: VolumetricPitoisState) -> tuple[np.ndarray, np.
     return z, r, kappa_meridional + kappa_azimuthal
 
 
-def _axisymmetric_neck_curvature_from_eq3_fit(
-    z: np.ndarray,
-    r: np.ndarray,
-    *,
-    side_rings: int,
-) -> float | None:
-    z = np.asarray(z, dtype=float)
-    r = np.asarray(r, dtype=float)
-    valid = np.isfinite(z) & np.isfinite(r) & (r > 0.0)
-    z = z[valid]
-    r = r[valid]
-    if z.size < 5:
-        return None
-
-    order = np.argsort(z)
-    z = z[order]
-    r = r[order]
-    waist_idx = int(np.argmin(r))
-    side = max(1, int(side_rings))
-    lo = max(0, waist_idx - side)
-    hi = min(len(z), waist_idx + side + 1)
-    fit_indices = [idx for idx in range(lo, hi) if idx != waist_idx]
-
-    if len(fit_indices) < 3:
-        lo = max(0, waist_idx - side)
-        hi = min(len(z), waist_idx + side + 1)
-        fit_indices = list(range(lo, hi))
-    if len(fit_indices) < 3:
-        return None
-
-    z_ref = float(z[waist_idx])
-    zz = z[np.asarray(fit_indices, dtype=int)] - z_ref
-    rr = r[np.asarray(fit_indices, dtype=int)]
-    if np.unique(np.round(zz, 15)).size < 3:
-        return None
-
-    try:
-        a, b, c = np.polyfit(zz, rr, 2)
-    except (TypeError, ValueError, np.linalg.LinAlgError):
-        return None
-
-    r_fit = float(c)
-    if (not np.isfinite(r_fit)) or r_fit <= 1.0e-12:
-        return None
-    dr_dz = float(b)
-    d2r_dz2 = float(2.0 * a)
-    denom = max(1.0 + dr_dz * dr_dz, 1.0e-12)
-    kappa_meridional = -d2r_dz2 / float(np.power(denom, 1.5))
-    kappa_azimuthal = 1.0 / max(r_fit * float(np.sqrt(denom)), 1.0e-12)
-    kappa = kappa_meridional + kappa_azimuthal
-    if not np.isfinite(kappa):
-        return None
-    return float(kappa)
-
-
 def _update_pressure_scalar(state: VolumetricPitoisState) -> None:
     if not state.config.use_axisymmetric_laplace_pressure:
         state.pressure_scalar = 0.0
         return
 
-    z, r, kappa = _axisymmetric_profile(state)
+    z, _r, kappa = _axisymmetric_profile(state)
     if z.size < 3:
         state.pressure_scalar = 0.0
-        return
-
-    kappa_fit = _axisymmetric_neck_curvature_from_eq3_fit(
-        z,
-        r,
-        side_rings=int(getattr(state.config, "pressure_neck_fit_side_rings", USER_PRESSURE_NECK_FIT_SIDE_RINGS)),
-    )
-    if kappa_fit is not None:
-        state.pressure_scalar = float(state.config.pressure_scale * state.config.gamma * kappa_fit)
         return
 
     center = len(kappa) // 2
@@ -1268,84 +973,13 @@ def _update_pressure_scalar(state: VolumetricPitoisState) -> None:
 
 def _clip_acceleration(accel: np.ndarray, state: VolumetricPitoisState) -> np.ndarray:
     accel = np.asarray(accel, dtype=float)
-    if not np.all(np.isfinite(accel)):
-        return np.zeros_like(accel, dtype=float)
     accel_norm = float(np.linalg.norm(accel))
     if accel_norm > state.config.max_acceleration:
         accel = accel * (state.config.max_acceleration / accel_norm)
     return accel
 
 
-def _state_finite_summary(state: VolumetricPitoisState) -> tuple[bool, str]:
-    vertices = list(getattr(state, "volume_export_vertices", [])) or list(getattr(state.HC, "V", []))
-    if not vertices:
-        return True, "no vertices"
-
-    coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-    velocities = np.asarray([np.asarray(getattr(v, "u", np.zeros(3, dtype=float))[:3], dtype=float) for v in vertices], dtype=float)
-    if not np.all(np.isfinite(coords)):
-        bad = np.argwhere(~np.isfinite(coords))[0]
-        return False, f"non-finite coordinate at vertex {int(bad[0])}, component {int(bad[1])}"
-    if not np.all(np.isfinite(velocities)):
-        bad = np.argwhere(~np.isfinite(velocities))[0]
-        return False, f"non-finite velocity at vertex {int(bad[0])}, component {int(bad[1])}"
-
-    max_coord = float(np.max(np.abs(coords)))
-    max_vel = float(np.max(np.linalg.norm(velocities, axis=1)))
-    volume = float(_snapshot_msh_volume_m3(state))
-    if not np.isfinite(volume):
-        return False, "non-finite .msh volume"
-    target_volume = float(getattr(state, "target_snapshot_volume_m3", volume))
-    if np.isfinite(target_volume) and target_volume > 0.0:
-        rel_volume_error = abs(volume - target_volume) / max(target_volume, 1.0e-30)
-        if rel_volume_error > float(getattr(state.config, "max_volume_rel_error_for_abort", 0.25)):
-            return False, (
-                f".msh volume drift: current = {volume:.6e} m^3, "
-                f"target = {target_volume:.6e} m^3, rel = {rel_volume_error:.6e}"
-            )
-    if not np.isfinite(max_coord) or max_coord > 1.0:
-        return False, f"coordinate blow-up: max |x| = {max_coord:.6e} m"
-    if not np.isfinite(max_vel) or max_vel > 1.0:
-        return False, f"velocity blow-up: max |u| = {max_vel:.6e} m/s"
-    return True, f"max |x| = {max_coord:.6e} m, max |u| = {max_vel:.6e} m/s, volume = {volume:.6e} m^3"
-
-
-def _assert_state_finite(state: VolumetricPitoisState, *, where: str) -> None:
-    ok, detail = _state_finite_summary(state)
-    if ok:
-        return
-    message = f"Non-finite/unstable state after {where}: {detail}"
-    if bool(USER_ABORT_ON_NONFINITE_STATE):
-        raise RuntimeError(message)
-    print(f"WARNING: {message}", flush=True)
-
-
-def _gmsh_numerical_rupture_reason(state: VolumetricPitoisState) -> str | None:
-    if (
-        (not bool(USER_STOP_ON_NUMERICAL_RUPTURE))
-        or (not bool(getattr(state, "gmsh_compute_mesh", False)))
-    ):
-        return None
-    target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
-    current = float(_snapshot_msh_volume_m3(state))
-    if (not np.isfinite(target)) or target <= 0.0 or (not np.isfinite(current)) or current <= 0.0:
-        return None
-    rel = abs(current - target) / max(target, 1.0e-30)
-    limit = max(float(USER_NUMERICAL_RUPTURE_VOLUME_REL_ERROR), 0.0)
-    if rel > limit:
-        return (
-            "fixed-topology bridge reached numerical rupture: "
-            f"volume residual {rel:.6e} exceeds {limit:.6e}"
-        )
-    return None
-
-
 def _boundary_vertex_lookup(state: VolumetricPitoisState) -> dict[tuple[float, float, float], object]:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        return {
-            tuple(np.round(np.asarray(v.x_a[:3], dtype=float), 12)): v
-            for v in state.surface_export_vertices
-        }
     lookup: dict[tuple[float, float, float], object] = {}
     for ring in state.outer_rings:
         for v in ring:
@@ -1983,9 +1617,82 @@ def _ring_segment_length_map(ring: list) -> dict[int, float]:
 
 
 def _Fcl(v, *, state: VolumetricPitoisState) -> np.ndarray:
-    # Surface tension in this case is supplied only by the validated Heron
-    # operator path, via _surface_tension_force_heron().
-    return np.zeros(3, dtype=float)
+    vid = id(v)
+    bottom_ids = {id(node) for node in state.bottom_contact_ring}
+    top_ids = {id(node) for node in state.top_contact_ring}
+    if vid in bottom_ids:
+        which = "bottom"
+        ring = state.bottom_contact_ring
+        sphere_center = np.asarray(state.bottom_sphere_center, dtype=float)
+    elif vid in top_ids:
+        which = "top"
+        ring = state.top_contact_ring
+        sphere_center = np.asarray(state.top_sphere_center, dtype=float)
+    else:
+        return np.zeros(3, dtype=float)
+
+    axis = np.asarray(state.top_sphere_center - state.bottom_sphere_center, dtype=float)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1.0e-30:
+        axis = np.array([0.0, 0.0, 1.0], dtype=float)
+    else:
+        axis = axis / axis_norm
+
+    contact_radius = float(_cap_radius(ring))
+    theta_geom = _contact_angle_for_radius(
+        state,
+        which=which,
+        sphere_center=sphere_center,
+        axis=axis,
+        contact_radius=contact_radius,
+    )
+    slide_speed = _contact_line_ring_speed(
+        state,
+        ring=ring,
+        sphere_center=sphere_center,
+        axis=axis,
+        which=which,
+    )
+    theta_dyn = _dynamic_contact_angle_from_speed(state, slide_speed=slide_speed)
+
+    radius = float(state.config.particle_radius)
+    dr_eps = max(1.0e-7 * radius, 1.0e-8)
+    r_minus = max(contact_radius - dr_eps, 1.0e-8 * radius)
+    r_plus = min(contact_radius + dr_eps, radius - 1.0e-8)
+    if r_plus <= r_minus:
+        return np.zeros(3, dtype=float)
+    theta_minus = _contact_angle_for_radius(
+        state,
+        which=which,
+        sphere_center=sphere_center,
+        axis=axis,
+        contact_radius=r_minus,
+    )
+    theta_plus = _contact_angle_for_radius(
+        state,
+        which=which,
+        sphere_center=sphere_center,
+        axis=axis,
+        contact_radius=r_plus,
+    )
+    dtheta_dr = (theta_plus - theta_minus) / max(r_plus - r_minus, 1.0e-30)
+    residual = theta_geom - theta_dyn
+    if abs(residual) <= 1.0e-12 or abs(dtheta_dr) <= 1.0e-12:
+        return np.zeros(3, dtype=float)
+
+    slide_dir = _contact_line_slide_direction(
+        np.asarray(v.x_a[:3], dtype=float),
+        sphere_center=sphere_center,
+        axis=axis,
+        which=which,
+    )
+    if float(np.linalg.norm(slide_dir)) <= 1.0e-30:
+        return np.zeros(3, dtype=float)
+
+    seg_len = _ring_segment_length_map(ring).get(vid, 0.0)
+    drive_sign = -np.sign(residual * dtheta_dr)
+    force_mag = float(state.config.gamma) * abs(np.cos(theta_geom) - np.cos(theta_dyn)) * float(seg_len)
+    return drive_sign * force_mag * slide_dir
 
 
 def _align_layer_azimuths(state: VolumetricPitoisState) -> None:
@@ -2298,393 +2005,239 @@ def _initialise_unduloid_like_equilibrium(state: VolumetricPitoisState) -> None:
     _update_duals_and_masses(state)
 
 
-def _gmsh_element_to_tets(element_type: int, row: list[int]) -> list[list[int]]:
-    if int(element_type) == 4 and len(row) >= 4:
-        return [row[:4]]
-    if int(element_type) == 5 and len(row) >= 8:
-        a, b, c, d, e, f, g, h = row[:8]
-        return [[a, b, d, e], [b, c, d, g], [b, d, e, g], [b, e, f, g], [d, e, g, h]]
-    if int(element_type) == 6 and len(row) >= 6:
-        a, b, c, d, e, f = row[:6]
-        return [[a, b, c, d], [b, c, d, e], [c, d, e, f]]
-    if int(element_type) == 7 and len(row) >= 5:
-        a, b, c, d, apex = row[:5]
-        return [[a, b, c, apex], [a, c, d, apex]]
-    return []
+def _latest_initialshape_msh_path() -> Path | None:
+    if INITIAL_MSH_PATH.exists():
+        return INITIAL_MSH_PATH
+    raise FileNotFoundError(f"Requested initial mesh does not exist: {INITIAL_MSH_PATH}")
 
 
-def _read_gmsh2_points_triangles_tets(path: Path, lines: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    idx = lines.index("$Nodes") + 1
-    n_nodes = int(lines[idx].split()[0])
-    idx += 1
-    node_tags: list[int] = []
-    points: list[tuple[float, float, float]] = []
-    for _node in range(n_nodes):
-        parts = lines[idx].split()
-        idx += 1
-        if len(parts) < 4:
-            raise ValueError(f"Bad Gmsh 2 node row while reading {path}: {parts}")
-        node_tags.append(int(parts[0]))
-        points.append((float(parts[1]), float(parts[2]), float(parts[3])))
-
-    tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
-    idx = lines.index("$Elements") + 1
-    n_elements = int(lines[idx].split()[0])
-    idx += 1
-    triangles: list[list[int]] = []
-    tets: list[list[int]] = []
-    for _element in range(n_elements):
-        parts = [int(x) for x in lines[idx].split()]
-        idx += 1
-        if len(parts) < 4:
-            continue
-        element_type = int(parts[1])
-        n_tags = int(parts[2])
-        node_part = parts[3 + n_tags :]
-        try:
-            row = [tag_to_idx[tag] for tag in node_part]
-        except KeyError as exc:
-            raise ValueError(f"Element references missing node tag {exc} while reading {path}") from exc
-        if element_type == 2 and len(row) >= 3:
-            triangles.append(row[:3])
-        elif element_type == 3 and len(row) >= 4:
-            a, b, c, d = row[:4]
-            triangles.append([a, b, c])
-            triangles.append([a, c, d])
-        else:
-            tets.extend(_gmsh_element_to_tets(element_type, row))
-
-    return (
-        np.asarray(points, dtype=float),
-        np.asarray(triangles, dtype=int),
-        np.asarray(tets, dtype=int),
-        np.asarray(node_tags, dtype=int),
-    )
-
-
-def _read_gmsh4_points_triangles_tets(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _read_gmsh2_nodes(path: Path) -> np.ndarray:
     lines = path.read_text(encoding="utf-8").splitlines()
-
-    mesh_format = lines[lines.index("$MeshFormat") + 1].split()
-    version = float(mesh_format[0]) if mesh_format else 4.1
-    if version < 4.0:
-        return _read_gmsh2_points_triangles_tets(path, lines)
-
-    idx = lines.index("$Nodes") + 1
-    n_blocks, n_nodes, _min_tag, _max_tag = map(int, lines[idx].split()[:4])
-    idx += 1
-    node_tags: list[int] = []
-    points: list[tuple[float, float, float]] = []
-    for _block in range(n_blocks):
-        _entity_dim, _entity_tag, _parametric, n_block_nodes = map(int, lines[idx].split()[:4])
-        idx += 1
-        block_tags = [int(lines[idx + j].split()[0]) for j in range(n_block_nodes)]
-        idx += n_block_nodes
-        for tag in block_tags:
-            xyz = lines[idx].split()
-            idx += 1
-            node_tags.append(int(tag))
-            points.append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
-    if len(points) != n_nodes:
-        raise ValueError(f"Node count mismatch while reading {path}")
-
-    tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
-    idx = lines.index("$Elements") + 1
-    n_blocks, _n_elements, _min_elem, _max_elem = map(int, lines[idx].split()[:4])
-    idx += 1
-    triangles: list[list[int]] = []
-    tets: list[list[int]] = []
-    for _block in range(n_blocks):
-        _entity_dim, _entity_tag, element_type, n_block_elements = map(int, lines[idx].split()[:4])
-        idx += 1
-        for _element in range(n_block_elements):
-            parts = [int(x) for x in lines[idx].split()]
-            idx += 1
-            row = [tag_to_idx[tag] for tag in parts[1:]]
-            if int(element_type) == 2 and len(row) >= 3:
-                triangles.append(row[:3])
-            elif int(element_type) == 3 and len(row) >= 4:
-                a, b, c, d = row[:4]
-                triangles.append([a, b, c])
-                triangles.append([a, c, d])
-            else:
-                tets.extend(_gmsh_element_to_tets(element_type, row))
-
-    return (
-        np.asarray(points, dtype=float),
-        np.asarray(triangles, dtype=int) if triangles else np.empty((0, 3), dtype=int),
-        np.asarray(tets, dtype=int) if tets else np.empty((0, 4), dtype=int),
-        np.asarray(node_tags, dtype=int),
-    )
-
-
-def _axisymmetric_profile_from_gmsh_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    pts = np.asarray(points, dtype=float)
-    z_abs = np.abs(pts[:, 2])
-    radii = np.linalg.norm(pts[:, :2], axis=1)
-
-    by_z: dict[float, float] = {}
-    for z_val, radius in zip(z_abs, radii):
-        key = round(float(z_val), 15)
-        by_z[key] = max(by_z.get(key, 0.0), float(radius))
-
-    half_z_all = np.asarray(sorted(by_z), dtype=float)
-    half_r_all = np.asarray([by_z[float(z)] for z in half_z_all], dtype=float)
-    if half_z_all.size < 2:
-        raise ValueError(f"Could not read an axisymmetric profile from {HARDCODED_INITIAL_MSH_PATH}")
-
-    keep_z: list[float] = []
-    keep_r: list[float] = []
-    current_max = -float("inf")
-    tol = max(1.0e-12, 1.0e-9 * float(np.max(half_r_all)))
-    for z_val, radius in zip(half_z_all, half_r_all):
-        if radius + tol < current_max:
+    for idx, line in enumerate(lines):
+        if line.strip() != "$Nodes":
             continue
-        keep_z.append(float(z_val))
-        keep_r.append(float(radius))
-        current_max = max(current_max, float(radius))
-
-    half_z = np.asarray(keep_z, dtype=float)
-    half_r = np.asarray(keep_r, dtype=float)
-    sample_s = np.concatenate((-half_z[:0:-1], half_z))
-    sample_r = np.concatenate((half_r[:0:-1], half_r))
-    return sample_s, sample_r
-
-
-def _ordered_ring_from_mask(vertices: list, points: np.ndarray, mask: np.ndarray) -> list:
-    ids = np.flatnonzero(mask)
-    if ids.size == 0:
-        return []
-    angles = np.arctan2(points[ids, 1], points[ids, 0])
-    order = np.argsort(angles)
-    return [vertices[int(ids[i])] for i in order]
+        n_nodes = int(lines[idx + 1].strip())
+        nodes = []
+        for row in lines[idx + 2 : idx + 2 + n_nodes]:
+            parts = row.split()
+            if len(parts) < 4:
+                raise ValueError(f"Malformed node row in {path}: {row}")
+            nodes.append((float(parts[1]), float(parts[2]), float(parts[3])))
+        return np.asarray(nodes, dtype=float)
+    raise ValueError(f"No $Nodes section found in {path}")
 
 
-def _gmsh_free_surface_rings(vertices: list, points: np.ndarray) -> list[list[object]]:
-    sample_s, sample_r = _axisymmetric_profile_from_gmsh_points(points)
-    z_vals = points[:, 2]
-    r_vals = np.linalg.norm(points[:, :2], axis=1)
-    z_span = max(float(np.max(z_vals) - np.min(z_vals)), 1.0e-12)
-    r_max = max(float(np.max(r_vals)), 1.0e-12)
-    z_tol = max(5.0e-12, 1.0e-8 * z_span)
-    r_tol = max(5.0e-12, 1.0e-6 * r_max)
-    rings: list[list[object]] = []
-    for z_target, r_target in zip(sample_s, sample_r):
-        mask = (np.abs(z_vals - float(z_target)) <= z_tol) & (np.abs(r_vals - float(r_target)) <= r_tol)
-        ring = _ordered_ring_from_mask(vertices, points, mask)
-        if len(ring) >= 3:
-            rings.append(ring)
-    if len(rings) < 2:
-        raise RuntimeError(f"Could not extract liquid-air rings directly from {HARDCODED_INITIAL_MSH_PATH}")
-    return rings
+def _read_gmsh2_tet_mesh(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    nodes = None
+    node_tag_to_idx: dict[int, int] = {}
+    tets: list[tuple[int, int, int, int]] = []
+
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx].strip()
+        if line == "$Nodes":
+            n_nodes = int(lines[idx + 1].strip())
+            node_rows = []
+            for row in lines[idx + 2 : idx + 2 + n_nodes]:
+                parts = row.split()
+                if len(parts) < 4:
+                    raise ValueError(f"Malformed node row in {path}: {row}")
+                node_tag_to_idx[int(parts[0])] = len(node_rows)
+                node_rows.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            nodes = np.asarray(node_rows, dtype=float)
+            idx += n_nodes + 2
+        elif line == "$Elements":
+            n_elements = int(lines[idx + 1].strip())
+            for row in lines[idx + 2 : idx + 2 + n_elements]:
+                parts = row.split()
+                if len(parts) < 4:
+                    continue
+                etype = int(parts[1])
+                ntags = int(parts[2])
+                conn = [node_tag_to_idx[int(x)] for x in parts[3 + ntags :]]
+                if etype == 4 and len(conn) == 4:
+                    tets.append(tuple(conn))
+            idx += n_elements + 2
+        idx += 1
+
+    if nodes is None:
+        raise ValueError(f"No $Nodes section found in {path}")
+    return np.asarray(nodes, dtype=float), np.asarray(tets, dtype=int)
 
 
-def _split_gmsh_boundary_triangles(
-    points: np.ndarray,
-    triangles: np.ndarray,
-    *,
-    bottom_sphere_center: np.ndarray,
-    top_sphere_center: np.ndarray,
-    radius: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    tri_idx = np.asarray(triangles, dtype=int)
-    if tri_idx.size == 0:
-        empty = np.empty((0, 3), dtype=int)
-        return empty, empty, empty
-
-    bottom: list[list[int]] = []
-    top: list[list[int]] = []
-    side: list[list[int]] = []
-    tol = max(2.0e-8, 2.0e-5 * float(radius))
-    for tri in tri_idx:
-        xyz = points[np.asarray(tri, dtype=int)]
-        centroid = np.mean(xyz, axis=0)
-        bottom_vertex = (
-            (xyz[:, 2] <= tol)
-            & (np.abs(np.linalg.norm(xyz - bottom_sphere_center[None, :], axis=1) - float(radius)) <= tol)
-        )
-        top_vertex = (
-            (xyz[:, 2] >= -tol)
-            & (np.abs(np.linalg.norm(xyz - top_sphere_center[None, :], axis=1) - float(radius)) <= tol)
-        )
-        if centroid[2] < 0.0 and bool(np.all(bottom_vertex)):
-            bottom.append([int(v) for v in tri])
-        elif centroid[2] > 0.0 and bool(np.all(top_vertex)):
-            top.append([int(v) for v in tri])
-        else:
-            side.append([int(v) for v in tri])
-
-    return (
-        np.asarray(side, dtype=int) if side else np.empty((0, 3), dtype=int),
-        np.asarray(bottom, dtype=int) if bottom else np.empty((0, 3), dtype=int),
-        np.asarray(top, dtype=int) if top else np.empty((0, 3), dtype=int),
-    )
-
-
-def _build_gmsh_axisym_ring_specs(
-    vertices: list,
-    points: np.ndarray,
-    *,
-    bottom_sphere_center: np.ndarray,
-    top_sphere_center: np.ndarray,
-) -> list[SimpleNamespace]:
-    bottom = np.asarray(bottom_sphere_center, dtype=float)
-    top = np.asarray(top_sphere_center, dtype=float)
-    axis = top - bottom
-    axis_norm = float(np.linalg.norm(axis))
-    if axis_norm <= 1.0e-30:
-        axis = np.array([0.0, 0.0, 1.0], dtype=float)
-    else:
-        axis = axis / axis_norm
-    mid = 0.5 * (bottom + top)
-    e1, e2 = _orthonormal_tangent_basis(axis, np.array([1.0, 0.0, 0.0], dtype=float))
-
+def _boundary_surface_points_from_tets(points: np.ndarray, tets: np.ndarray) -> np.ndarray:
     pts = np.asarray(points, dtype=float)
-    groups: dict[tuple[float, float], list[tuple[float, object]]] = defaultdict(list)
-    for vertex, point in zip(vertices, pts):
-        rel = np.asarray(point, dtype=float) - mid
-        s = float(np.dot(rel, axis))
-        radial_vec = rel - s * axis
-        r = float(np.linalg.norm(radial_vec))
-        if r <= 1.0e-30:
-            angle = 0.0
+    tet_idx = np.asarray(tets, dtype=int)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+        return np.empty((0, 3), dtype=float)
+    if tet_idx.ndim != 2 or tet_idx.shape[1] != 4 or tet_idx.shape[0] == 0:
+        return np.asarray(pts, dtype=float)
+
+    face_counts: dict[tuple[int, int, int], int] = defaultdict(int)
+    for a, b, c, d in tet_idx:
+        for face in (
+            tuple(sorted((int(a), int(b), int(c)))),
+            tuple(sorted((int(a), int(b), int(d)))),
+            tuple(sorted((int(a), int(c), int(d)))),
+            tuple(sorted((int(b), int(c), int(d)))),
+        ):
+            face_counts[face] += 1
+
+    boundary_ids: set[int] = set()
+    for face, count in face_counts.items():
+        if count == 1:
+            boundary_ids.update(face)
+    if not boundary_ids:
+        return np.asarray(pts, dtype=float)
+    return np.asarray([pts[idx] for idx in sorted(boundary_ids)], dtype=float)
+
+
+def _axisymmetric_profile_from_surface_points(
+    points: np.ndarray,
+    *,
+    axis: np.ndarray,
+    axis_origin: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+
+    axis = np.asarray(axis, dtype=float)
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-30)
+    axis_origin = np.asarray(axis_origin, dtype=float)
+
+    s_vals = np.dot(pts - axis_origin[None, :], axis)
+    order = np.argsort(s_vals)
+    pts = pts[order]
+    s_vals = s_vals[order]
+    span = float(np.max(s_vals) - np.min(s_vals)) if s_vals.size else 0.0
+    tol = max(1.0e-10, 1.0e-6 * max(span, 1.0))
+
+    samples_s: list[float] = []
+    samples_r: list[float] = []
+    cluster_points: list[np.ndarray] = []
+    cluster_s: list[float] = []
+
+    def flush_cluster() -> None:
+        if not cluster_points:
+            return
+        arr = np.asarray(cluster_points, dtype=float)
+        center = np.mean(arr, axis=0)
+        rel = arr - center[None, :]
+        rel -= np.outer(np.dot(rel, axis), axis)
+        radius = float(np.mean(np.linalg.norm(rel, axis=1)))
+        samples_s.append(float(np.mean(cluster_s)))
+        samples_r.append(radius)
+
+    current_mean = None
+    for point, sval in zip(pts, s_vals):
+        if current_mean is None or abs(float(sval) - float(current_mean)) <= tol:
+            cluster_points.append(point)
+            cluster_s.append(float(sval))
+            current_mean = float(np.mean(cluster_s))
         else:
-            angle = float(np.arctan2(float(np.dot(radial_vec, e2)), float(np.dot(radial_vec, e1))))
-        groups[(round(s, 12), round(r, 12))].append((angle, vertex))
+            flush_cluster()
+            cluster_points = [point]
+            cluster_s = [float(sval)]
+            current_mean = float(sval)
+    flush_cluster()
 
-    specs: list[SimpleNamespace] = []
-    for (s0, r0), entries in groups.items():
-        entries.sort(key=lambda item: item[0])
-        specs.append(
-            SimpleNamespace(
-                s0=float(s0),
-                r0=float(r0),
-                vertices=[vertex for _angle, vertex in entries],
-                angles=tuple(float(angle) for angle, _vertex in entries),
-            )
-        )
-    specs.sort(key=lambda spec: (float(spec.s0), float(spec.r0), len(spec.vertices)))
-    return specs
+    return np.asarray(samples_s, dtype=float), np.asarray(samples_r, dtype=float)
 
 
-def _prepare_gmsh_state(config: VolumetricPitoisConfig) -> VolumetricPitoisState:
-    initial_msh_path = _required_initial_msh_path()
-    points, triangles, tets, _node_tags = _read_gmsh4_points_triangles_tets(initial_msh_path)
-    HC = Complex(3, domain=None)
-    vertices = [HC.V[tuple(float(x) for x in point)] for point in points]
+def _apply_axisymmetric_profile_samples(
+    state: VolumetricPitoisState,
+    *,
+    sample_s: np.ndarray,
+    sample_r: np.ndarray,
+) -> None:
+    sample_s = np.asarray(sample_s, dtype=float)
+    sample_r = np.asarray(sample_r, dtype=float)
+    if sample_s.size < 2 or sample_r.size != sample_s.size:
+        raise ValueError("Need at least two axisymmetric profile samples to initialize Case_2b_axisym from .msh")
 
-    for tet in np.asarray(tets, dtype=int):
-        tet_vertices = [vertices[int(i)] for i in tet]
-        for a in range(4):
-            for b in range(a + 1, 4):
-                tet_vertices[a].connect(tet_vertices[b])
-    for tri in np.asarray(triangles, dtype=int):
-        tri_vertices = [vertices[int(i)] for i in tri]
-        for a in range(3):
-            tri_vertices[a].connect(tri_vertices[(a + 1) % 3])
-    HC.gmsh_volume_vertices = list(vertices)
-    HC.gmsh_volume_tets = np.asarray(tets, dtype=int)
+    order = np.argsort(sample_s)
+    sample_s = sample_s[order]
+    sample_r = sample_r[order]
 
-    outer_rings = _gmsh_free_surface_rings(vertices, points)
-    layer_rings = [[ring] for ring in outer_rings]
-    layer_centers = [min(ring, key=lambda v: float(np.linalg.norm(np.asarray(v.x_a[:2], dtype=float)))) for ring in outer_rings]
-    z_bottom = float(np.mean([float(v.x_a[2]) for v in outer_rings[0]]))
-    z_top = float(np.mean([float(v.x_a[2]) for v in outer_rings[-1]]))
-    contact_radius = 0.5 * (_cap_radius(outer_rings[0]) + _cap_radius(outer_rings[-1]))
-    axial_offset = float(np.sqrt(max(float(config.particle_radius) ** 2 - contact_radius**2, 0.0)))
-    bottom_sphere_center = np.array([0.0, 0.0, z_bottom - axial_offset], dtype=float)
-    top_sphere_center = np.array([0.0, 0.0, z_top + axial_offset], dtype=float)
+    span = float(sample_s[-1] - sample_s[0])
+    if span <= 1.0e-30:
+        raise ValueError("Degenerate axisymmetric profile span in .msh")
 
-    dist_bottom = np.abs(np.linalg.norm(points - bottom_sphere_center[None, :], axis=1) - float(config.particle_radius))
-    dist_top = np.abs(np.linalg.norm(points - top_sphere_center[None, :], axis=1) - float(config.particle_radius))
-    sphere_tol = max(2.0e-8, 2.0e-5 * float(config.particle_radius))
-    cap_bottom = [vertices[int(i)] for i in np.flatnonzero((points[:, 2] <= sphere_tol) & (dist_bottom <= sphere_tol))]
-    cap_top = [vertices[int(i)] for i in np.flatnonzero((points[:, 2] >= -sphere_tol) & (dist_top <= sphere_tol))]
-    cap_bottom_center = min(cap_bottom, key=lambda v: float(np.linalg.norm(np.asarray(v.x_a[:2], dtype=float)))) if cap_bottom else outer_rings[0][0]
-    cap_top_center = min(cap_top, key=lambda v: float(np.linalg.norm(np.asarray(v.x_a[:2], dtype=float)))) if cap_top else outer_rings[-1][0]
+    sample_frac = (sample_s - sample_s[0]) / span
+    target_frac = np.asarray(state.layer_fractions, dtype=float)
+    target_s = np.interp(target_frac, sample_frac, sample_s)
+    target_r = np.interp(target_frac, sample_frac, sample_r)
 
-    side_tris, bottom_cap_tris, top_cap_tris = _split_gmsh_boundary_triangles(
-        points,
-        triangles,
-        bottom_sphere_center=bottom_sphere_center,
-        top_sphere_center=top_sphere_center,
-        radius=float(config.particle_radius),
+    mid, axis, e1, e2, layer_data = _initial_axisymmetric_template(state)
+    for layer, axial_s, outer_radius in zip(layer_data, target_s, target_r):
+        center_coord = mid + float(axial_s) * axis
+        _move(layer["center_vertex"], tuple(center_coord), state.HC, state.bV_caps)
+        for ordered_vertices, factor in layer["rings"]:
+            ring_radius = max(float(factor) * float(outer_radius), 0.0)
+            n_ring = max(1, len(ordered_vertices))
+            targets = []
+            for i, _v in enumerate(ordered_vertices):
+                phi = 2.0 * np.pi * float(i) / float(n_ring)
+                target = center_coord + ring_radius * (np.cos(phi) * e1 + np.sin(phi) * e2)
+                targets.append(tuple(target))
+            _move_vertices_batch(ordered_vertices, targets, state.HC, state.bV_caps)
+
+    _rebuild_cap_on_sphere(
+        state,
+        which="bottom",
+        sphere_center=state.bottom_sphere_center,
+        contact_radius=float(target_r[0]),
+        axis=axis,
+        dt=None,
+    )
+    _rebuild_cap_on_sphere(
+        state,
+        which="top",
+        sphere_center=state.top_sphere_center,
+        contact_radius=float(target_r[-1]),
+        axis=axis,
+        dt=None,
     )
 
-    interface_ids = {id(v) for ring in outer_rings for v in ring}
-    cap_ids = {id(v) for v in cap_bottom + cap_top}
-    for v in vertices:
-        v.cap_id = "bottom" if v in cap_bottom else ("top" if v in cap_top else None)
-        v.phase = 0
-        v.p = 0.0
-        v.u = np.zeros(3, dtype=float)
-        v.boundary = bool(id(v) in interface_ids or id(v) in cap_ids)
-        v.is_interface = bool(id(v) in interface_ids)
-        v.interface_phases = frozenset({0, 1}) if v.is_interface else frozenset()
 
-    layer_z = np.asarray([np.mean([float(v.x_a[2]) for v in ring]) for ring in outer_rings], dtype=float)
-    z_span = max(float(layer_z[-1] - layer_z[0]), 1.0e-30)
-    layer_fractions = tuple(float((z - layer_z[0]) / z_span) for z in layer_z)
-    mesh_volume_m3 = _indexed_tet_mesh_volume_m3(points, tets)
-    mps = SimpleNamespace(
-        get_gamma_pair=lambda phase_a, phase_b: config.gamma,
-        get_mu=lambda phase: config.mu_f,
-    )
+def _load_last_initialshape_profile_into_state(state: VolumetricPitoisState) -> Path | None:
+    msh_path = _latest_initialshape_msh_path()
+    if msh_path is None:
+        return None
 
-    state = VolumetricPitoisState(
-        config=config,
-        HC=HC,
-        bV_caps=set(),
-        cap_bottom=cap_bottom,
-        cap_top=cap_top,
-        cap_bottom_interior=[],
-        cap_top_interior=[],
-        bottom_contact_ring=[],
-        top_contact_ring=[],
-        cap_bottom_center=cap_bottom_center,
-        cap_top_center=cap_top_center,
-        layer_centers=layer_centers,
-        layer_fractions=layer_fractions,
-        outer_rings=outer_rings,
-        layer_rings=layer_rings,
-        surface_edges=[],
-        surface_boundary_indices=set(),
-        mps=mps,
-        radial_scale=1.0,
-        axial_scale=1.0,
-        initial_gap=float(np.linalg.norm(top_sphere_center - bottom_sphere_center) - 2.0 * float(config.particle_radius)),
-        cap_ring_factors=(1.0,),
-        bottom_sphere_center=bottom_sphere_center,
-        top_sphere_center=top_sphere_center,
-        target_volume_m3=float(mesh_volume_m3),
-        target_snapshot_volume_m3=float(mesh_volume_m3),
+    all_points, tets = _read_gmsh2_tet_mesh(msh_path)
+    volume_vertices = _volume_export_vertex_order(state)
+    if all_points.shape[0] == len(volume_vertices):
+        # The initial-shape file is the same fixed-topology volumetric mesh.
+        # Load x,y,z node-for-node instead of re-deriving a side profile from
+        # boundary tetra faces; the latter includes wetted cap nodes and corrupts
+        # the liquid-gas curvature used for pressure.
+        _move_vertices_batch(volume_vertices, [tuple(point) for point in all_points], state.HC, state.bV_caps)
+        _refresh_cap_boundary_sets(state)
+        _update_duals_and_masses(state)
+        _update_pressure_scalar(state)
+        if tets.size:
+            state.target_snapshot_volume_m3 = float(_indexed_tet_mesh_volume_m3(all_points, tets))
+        return msh_path
+
+    bottom_plane_center, top_plane_center, axis = _contact_plane_centers_and_axis(
+        SimpleNamespace(outer_rings=state.outer_rings)
     )
-    state.gmsh_compute_mesh = True
-    state.gmsh_axisym_reference = np.array([1.0, 0.0, 0.0], dtype=float)
-    state.gmsh_axisym_ring_specs = _build_gmsh_axisym_ring_specs(
-        vertices,
-        points,
-        bottom_sphere_center=bottom_sphere_center,
-        top_sphere_center=top_sphere_center,
+    boundary_points = _boundary_surface_points_from_tets(all_points, tets)
+    sample_s, sample_r = _axisymmetric_profile_from_surface_points(
+        boundary_points,
+        axis=axis,
+        axis_origin=0.5 * (bottom_plane_center + top_plane_center),
     )
-    state.loaded_initial_msh_path = str(initial_msh_path)
-    state.volume_export_vertices = list(vertices)
-    state.volume_export_node_ids = {id(vertex): idx for idx, vertex in enumerate(vertices)}
-    state.volume_export_tets = np.asarray(tets, dtype=int)
-    state.surface_export_vertices = list(vertices)
-    state.surface_export_node_ids = {id(vertex): idx for idx, vertex in enumerate(vertices)}
-    state.surface_export_side_tris = np.asarray(side_tris, dtype=int)
-    state.surface_export_bottom_cap_tris = np.asarray(bottom_cap_tris, dtype=int)
-    state.surface_export_top_cap_tris = np.asarray(top_cap_tris, dtype=int)
+    _apply_axisymmetric_profile_samples(state, sample_s=sample_s, sample_r=sample_r)
     _refresh_cap_boundary_sets(state)
-    state.frozen_volume_vertex_id_order = tuple(id(vertex) for vertex in state.volume_export_vertices)
-    state.frozen_surface_vertex_id_order = tuple(id(vertex) for vertex in state.surface_export_vertices)
-    state.frozen_layer_ring_id_structure = _layer_ring_id_structure(state)
-    state.topology_frozen = True
-    _set_cap_velocities(state)
     _update_duals_and_masses(state)
     _update_pressure_scalar(state)
-    return state
+    if tets.size:
+        state.target_snapshot_volume_m3 = float(_indexed_tet_mesh_volume_m3(all_points, tets))
+    return msh_path
 
 
 def _isotonic_increasing_fit(values: np.ndarray) -> np.ndarray:
@@ -2725,6 +2278,23 @@ def _single_neck_projected_radii(radii: np.ndarray) -> np.ndarray:
     right_fit[0] = neck_radius
 
     return np.concatenate([left_fit[:-1], right_fit])
+
+
+def _enforce_single_neck_axisymmetric_profile(state: VolumetricPitoisState) -> None:
+    sample_s = []
+    sample_r = []
+    for ring in state.outer_rings:
+        coords = np.array([np.asarray(v.x_a[:3], dtype=float) for v in ring], dtype=float)
+        sample_s.append(float(np.mean(coords[:, 2])))
+        sample_r.append(float(np.mean(np.linalg.norm(coords[:, :2], axis=1))))
+
+    s_arr = np.asarray(sample_s, dtype=float)
+    r_arr = np.asarray(sample_r, dtype=float)
+    if s_arr.size != len(state.outer_rings) or r_arr.size != len(state.outer_rings):
+        return
+
+    projected_r = _single_neck_projected_radii(r_arr)
+    _apply_axisymmetric_profile_samples(state, sample_s=s_arr, sample_r=projected_r)
 
 
 def _scale_free_vertices_radially(
@@ -3234,6 +2804,169 @@ def _update_moving_contact_line(state: VolumetricPitoisState, *, dt: float | Non
         state.last_top_contact_line_speed = 0.0
 
 
+def _prepare_state(config: VolumetricPitoisConfig) -> VolumetricPitoisState:
+    is_initialshape_builder = str(getattr(config, "name", "")) == "Case_2b_axisym_initialshape"
+    (
+        HC,
+        _bV_vol,
+        outer_rings,
+        layer_rings,
+        surface_edges,
+        surface_boundary_indices,
+    ) = _build_structured_volumetric_catenoid(
+        config.refinement,
+        radial_ring_factors_override=_radial_ring_factors_with_outer_refinement(
+            config.contact_line_radial_rings,
+            config.extra_cl_radial_rings,
+            config.contact_line_radial_bias_ratio,
+        ),
+        axial_ring_stride_override=config.axial_ring_stride,
+        neck_extra_axial_layers_override=config.neck_extra_axial_layers,
+        contact_extra_axial_layers_override=config.cl_extra_axial_layers,
+    )
+
+    top_ring = outer_rings[-1]
+    radial_scale = config.target_cap_radius / max(_cap_radius(top_ring), 1.0e-30)
+    contact_radius = radial_scale * max(_cap_radius(top_ring), 1.0e-30)
+    axial_offset = float(np.sqrt(max(config.particle_radius**2 - contact_radius**2, 0.0)))
+
+    z_vals_unit = [float(v.x_a[2]) for v in HC.V]
+    unit_gap = max(z_vals_unit) - min(z_vals_unit)
+    target_surface_gap = config.initial_d_over_r * config.particle_radius
+    target_contact_plane_gap = target_surface_gap + 2.0 * (config.particle_radius - axial_offset)
+    axial_scale = target_contact_plane_gap / max(unit_gap, 1.0e-30)
+
+    _scale_mesh(HC, radial_scale, axial_scale)
+    if int(config.cl_extra_axial_layers) > 0:
+        layer_z = np.asarray(
+            [
+                float(np.mean([float(v.x_a[2]) for v in ring]))
+                for ring in outer_rings
+            ],
+            dtype=float,
+        )
+        z_span = max(float(layer_z[-1] - layer_z[0]), 1.0e-30)
+        sidewall_layer_fractions = tuple(float((z - layer_z[0]) / z_span) for z in layer_z)
+    else:
+        sidewall_layer_fractions = _sidewall_layer_fractions_with_contact_refinement(
+            len(outer_rings),
+            config.contact_line_radial_bias_ratio,
+        )
+    _redistribute_sidewall_layers_axially(
+        HC,
+        outer_rings,
+        layer_rings,
+        sidewall_layer_fractions,
+    )
+
+    z_vals = [float(v.x_a[2]) for v in HC.V]
+    z_min = min(z_vals)
+    z_max = max(z_vals)
+    cap_bottom = [v for v in HC.V if abs(float(v.x_a[2]) - z_min) < 1.0e-12]
+    cap_top = [v for v in HC.V if abs(float(v.x_a[2]) - z_max) < 1.0e-12]
+    cap_bottom_center = min(cap_bottom, key=lambda v: float(np.linalg.norm(np.asarray(v.x_a[:2], dtype=float))))
+    cap_top_center = min(cap_top, key=lambda v: float(np.linalg.norm(np.asarray(v.x_a[:2], dtype=float))))
+    layer_centers = []
+    for ring in outer_rings:
+        z_ref = float(np.mean([float(v.x_a[2]) for v in ring]))
+        same_layer = [v for v in HC.V if abs(float(v.x_a[2]) - z_ref) < 1.0e-12]
+        layer_centers.append(
+            min(same_layer, key=lambda v: float(np.linalg.norm(np.asarray(v.x_a[:2], dtype=float))))
+        )
+    cap_ring_factors = tuple(
+        max(_cap_radius(ring), 0.0) / max(_cap_radius(layer_rings[0][-1]), 1.0e-30)
+        for ring in layer_rings[0]
+    )
+    bottom_plane_center, top_plane_center, axis = _contact_plane_centers_and_axis(SimpleNamespace(outer_rings=outer_rings))
+    bottom_sphere_center = bottom_plane_center - axial_offset * axis
+    top_sphere_center = top_plane_center + axial_offset * axis
+
+    for v in HC.V:
+        v.cap_id = None
+        v.phase = 0
+        v.p = 0.0
+        v.u = np.zeros(3, dtype=float)
+    for v in cap_bottom:
+        v.cap_id = "bottom"
+    for v in cap_top:
+        v.cap_id = "top"
+
+    for v in HC.V:
+        v.is_interface = bool(getattr(v, "boundary", False) and v.cap_id is None)
+        v.interface_phases = frozenset({0, 1}) if v.is_interface else frozenset()
+
+    mps = SimpleNamespace(
+        get_gamma_pair=lambda phase_a, phase_b: config.gamma,
+        get_mu=lambda phase: config.mu_f,
+    )
+
+    state = VolumetricPitoisState(
+        config=config,
+        HC=HC,
+        bV_caps=set(),
+        cap_bottom=cap_bottom,
+        cap_top=cap_top,
+        cap_bottom_interior=[],
+        cap_top_interior=[],
+        bottom_contact_ring=[],
+        top_contact_ring=[],
+        cap_bottom_center=cap_bottom_center,
+        cap_top_center=cap_top_center,
+        layer_centers=layer_centers,
+        layer_fractions=tuple(sidewall_layer_fractions),
+        outer_rings=outer_rings,
+        layer_rings=layer_rings,
+        surface_edges=surface_edges,
+        surface_boundary_indices=surface_boundary_indices,
+        mps=mps,
+        radial_scale=radial_scale,
+        axial_scale=axial_scale,
+        initial_gap=target_surface_gap,
+        cap_ring_factors=cap_ring_factors,
+        bottom_sphere_center=np.asarray(bottom_sphere_center, dtype=float),
+        top_sphere_center=np.asarray(top_sphere_center, dtype=float),
+        target_volume_m3=float(config.initial_bridge_volume_m3),
+        target_snapshot_volume_m3=float(config.initial_bridge_volume_m3),
+    )
+    _refresh_cap_boundary_sets(state)
+    _set_cap_velocities(state)
+    loaded_msh_path = None
+    imported_target_msh_volume_m3 = None
+    if bool(config.use_last_initialshape_msh):
+        loaded_msh_path = _load_last_initialshape_profile_into_state(state)
+        if loaded_msh_path is not None:
+            imported_target_msh_volume_m3 = float(state.target_snapshot_volume_m3)
+            print(f"Loaded initial surface    = {loaded_msh_path}")
+    if loaded_msh_path is None and not is_initialshape_builder:
+        _initialise_unduloid_like_equilibrium(state)
+        _relax_initial_equilibrium(state)
+    _canonicalize_ring_orders(state)
+    _freeze_surface_topology(state)
+    _update_duals_and_masses(state)
+    _update_pressure_scalar(state)
+    if imported_target_msh_volume_m3 is not None:
+        state.target_snapshot_volume_m3 = float(imported_target_msh_volume_m3)
+        _project_volume_to_target(state)
+        _update_duals_and_masses(state)
+        _update_pressure_scalar(state)
+        state.target_volume_m3 = float(state.target_snapshot_volume_m3)
+    else:
+        state.target_volume_m3 = float(config.initial_bridge_volume_m3)
+        state.target_snapshot_volume_m3 = float(config.initial_bridge_volume_m3)
+        if not is_initialshape_builder:
+            _force_snapshot_volume_to_target(
+                state,
+                target_m3=float(config.initial_bridge_volume_m3),
+                rel_tol=min(float(config.volume_projection_rel_tol), 1.0e-8),
+                max_iters=max(16, int(config.volume_projection_max_iters)),
+            )
+            _update_duals_and_masses(state)
+            _update_pressure_scalar(state)
+    if loaded_msh_path is not None:
+        print(f"Imported target .msh vol. = {1.0e9 * state.target_snapshot_volume_m3:.6f} uL")
+    return state
+
+
 def _move_caps(state: VolumetricPitoisState, *, dt: float | None = None) -> None:
     if dt is None:
         dt = float(state.config.dt)
@@ -3321,13 +3054,7 @@ def _vertex_acceleration(v, *, state: VolumetricPitoisState) -> np.ndarray:
 
 
 def _axisym_clear_caches(state: VolumetricPitoisState) -> None:
-    for attr in (
-        "_axisym_force_cache",
-        "_axisym_accel_cache",
-        "_gmsh_axisym_force_cache",
-        "_gmsh_axisym_accel_cache",
-        "_gmsh_surface_heron_force_cache",
-    ):
+    for attr in ("_axisym_force_cache", "_axisym_accel_cache"):
         if hasattr(state, attr):
             delattr(state, attr)
 
@@ -3490,408 +3217,7 @@ def _axisym_force_cache_key(
     )
 
 
-def _gmsh_axisym_basis(state: VolumetricPitoisState) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    bottom_center, top_center, axis = _particle_centers_physical(state)
-    mid = 0.5 * (bottom_center + top_center)
-    reference = np.asarray(getattr(state, "gmsh_axisym_reference", np.array([1.0, 0.0, 0.0])), dtype=float)
-    e1, e2 = _orthonormal_tangent_basis(axis, reference)
-    return mid, axis, e1, e2
-
-
-def _gmsh_axisym_spec_radial_units(spec, e1: np.ndarray, e2: np.ndarray) -> list[np.ndarray]:
-    return [
-        float(np.cos(angle)) * e1 + float(np.sin(angle)) * e2
-        for angle in getattr(spec, "angles", ())
-    ]
-
-
-def _gmsh_axisym_group_axial_radius(
-    vertices: list,
-    *,
-    center_coord: np.ndarray,
-    axis: np.ndarray,
-) -> tuple[float, float]:
-    if not vertices:
-        return 0.0, 0.0
-    coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-    rel = coords - center_coord[None, :]
-    axial = np.dot(rel, axis)
-    radial = rel - np.outer(axial, axis)
-    return float(np.mean(axial)), float(np.mean(np.linalg.norm(radial, axis=1)))
-
-
-def _gmsh_axisym_uniform_cap_id(vertices: list) -> str | None:
-    cap_ids = {getattr(v, "cap_id", None) for v in vertices}
-    if cap_ids == {"bottom"}:
-        return "bottom"
-    if cap_ids == {"top"}:
-        return "top"
-    return None
-
-
-def _gmsh_contact_span_axial_bounds(
-    state: VolumetricPitoisState,
-    mid: np.ndarray,
-    axis: np.ndarray,
-) -> tuple[float, float] | None:
-    centers: list[float] = []
-    for ring in (state.bottom_contact_ring, state.top_contact_ring):
-        ring_vertices = list(ring)
-        if not ring_vertices:
-            continue
-        coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in ring_vertices], dtype=float)
-        centers.append(float(np.mean(np.dot(coords - mid[None, :], axis))))
-    if len(centers) != 2:
-        return None
-    return min(centers), max(centers)
-
-
-def _gmsh_interface_fraction_bounds(state: VolumetricPitoisState) -> dict[int, tuple[float, float]]:
-    cached = getattr(state, "_gmsh_interface_fraction_bounds_cache", None)
-    if cached is not None:
-        return cached
-    interface_specs = [
-        spec
-        for spec in getattr(state, "gmsh_axisym_ring_specs", [])
-        if any(bool(getattr(v, "is_interface", False)) for v in getattr(spec, "vertices", []))
-    ]
-    interface_specs.sort(key=lambda spec: float(getattr(spec, "s0", 0.0)))
-    if len(interface_specs) < 3:
-        state._gmsh_interface_fraction_bounds_cache = {}
-        return {}
-    s_vals = np.asarray([float(getattr(spec, "s0", 0.0)) for spec in interface_specs], dtype=float)
-    s_min = float(np.min(s_vals))
-    s_max = float(np.max(s_vals))
-    span = max(s_max - s_min, 1.0e-30)
-    fractions = (s_vals - s_min) / span
-    bounds: dict[int, tuple[float, float]] = {}
-    for idx, spec in enumerate(interface_specs):
-        if idx == 0 or idx == len(interface_specs) - 1:
-            continue
-        lower = 0.5 * (float(fractions[idx - 1]) + float(fractions[idx]))
-        upper = 0.5 * (float(fractions[idx]) + float(fractions[idx + 1]))
-        bounds[id(spec)] = (lower, upper)
-    state._gmsh_interface_fraction_bounds_cache = bounds
-    return bounds
-
-
-def _gmsh_axisymmetrize_geometry(state: VolumetricPitoisState) -> None:
-    if (not bool(USER_ENFORCE_FULL_AXISYMMETRY)) or (not bool(getattr(state, "gmsh_compute_mesh", False))):
-        return
-    specs = list(getattr(state, "gmsh_axisym_ring_specs", []))
-    if not specs:
-        return
-    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
-    radius = float(state.config.particle_radius)
-    contact_bounds = _gmsh_contact_span_axial_bounds(state, mid, axis)
-    interface_fraction_bounds = _gmsh_interface_fraction_bounds(state)
-    span_margin = max(1.0e-9, 1.0e-6 * radius)
-    contact_radius_limit = max(
-        _cap_radius(state.bottom_contact_ring),
-        _cap_radius(state.top_contact_ring),
-        1.0e-30,
-    ) * 1.001
-    for spec in specs:
-        vertices = list(getattr(spec, "vertices", []))
-        if not vertices:
-            continue
-        _s_mean, r_mean = _gmsh_axisym_group_axial_radius(vertices, center_coord=mid, axis=axis)
-        cap_id = _gmsh_axisym_uniform_cap_id(vertices)
-        is_free_interface = any(bool(getattr(v, "is_interface", False)) for v in vertices)
-        if (
-            bool(USER_CLAMP_INTERFACE_RADIUS_TO_CONTACT)
-            and cap_id is None
-            and is_free_interface
-        ):
-            r_mean = float(np.clip(r_mean, 0.0, contact_radius_limit))
-        if cap_id is None:
-            coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-            rel = coords - mid[None, :]
-            axial = np.dot(rel, axis)
-            center_axial = float(np.mean(axial))
-            if (
-                bool(USER_CLAMP_INTERFACE_TO_CONTACT_SPAN)
-                and contact_bounds is not None
-                and is_free_interface
-            ):
-                lo, hi = contact_bounds
-                if bool(USER_PRESERVE_INTERFACE_AXIAL_ORDER):
-                    frac_bounds = interface_fraction_bounds.get(id(spec))
-                    if frac_bounds is not None:
-                        f_lo, f_hi = frac_bounds
-                        center_axial = float(np.clip(center_axial, lo + f_lo * (hi - lo), lo + f_hi * (hi - lo)))
-                if hi - lo > 2.0 * span_margin:
-                    center_axial = float(np.clip(center_axial, lo + span_margin, hi - span_margin))
-                else:
-                    center_axial = float(np.clip(center_axial, lo, hi))
-            center_coord = mid + center_axial * axis
-        else:
-            sphere_center = (
-                np.asarray(state.bottom_sphere_center, dtype=float)
-                if cap_id == "bottom"
-                else np.asarray(state.top_sphere_center, dtype=float)
-            )
-            sign = 1.0 if cap_id == "bottom" else -1.0
-            cap_r = float(np.clip(r_mean, 0.0, radius))
-            axial_offset = float(np.sqrt(max(radius**2 - cap_r**2, 0.0)))
-            center_coord = sphere_center + sign * axial_offset * axis
-            r_mean = cap_r
-
-        angles = tuple(getattr(spec, "angles", ()))
-        if len(vertices) == 1 or r_mean <= 1.0e-30:
-            targets = [tuple(center_coord) for _v in vertices]
-        else:
-            targets = [
-                tuple(center_coord + r_mean * (float(np.cos(angle)) * e1 + float(np.sin(angle)) * e2))
-                for angle in angles
-            ]
-        _move_vertices_batch(vertices, targets, state.HC, state.bV_caps)
-    _axisym_clear_caches(state)
-
-
-def _gmsh_axisymmetrize_velocity_field(state: VolumetricPitoisState) -> None:
-    if (not bool(USER_ENFORCE_FULL_AXISYMMETRY)) or (not bool(getattr(state, "gmsh_compute_mesh", False))):
-        return
-    specs = list(getattr(state, "gmsh_axisym_ring_specs", []))
-    if not specs:
-        return
-    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
-    contact_bounds = _gmsh_contact_span_axial_bounds(state, mid, axis)
-    span_margin = max(1.0e-9, 1.0e-6 * float(state.config.particle_radius))
-    contact_radius_limit = max(
-        _cap_radius(state.bottom_contact_ring),
-        _cap_radius(state.top_contact_ring),
-        1.0e-30,
-    ) * 1.001
-    for spec in specs:
-        vertices = list(getattr(spec, "vertices", []))
-        if not vertices:
-            continue
-        units = _gmsh_axisym_spec_radial_units(spec, e1, e2)
-        if len(vertices) == 1 or float(getattr(spec, "r0", 0.0)) <= 1.0e-30:
-            uz = float(np.mean([float(np.dot(np.asarray(v.u[:3], dtype=float), axis)) for v in vertices]))
-            for v in vertices:
-                v.u = uz * axis
-            continue
-        ur = float(
-            np.mean(
-                [
-                    float(np.dot(np.asarray(v.u[:3], dtype=float), e_r))
-                    for v, e_r in zip(vertices, units)
-                ]
-            )
-        )
-        uz = float(np.mean([float(np.dot(np.asarray(v.u[:3], dtype=float), axis)) for v in vertices]))
-        cap_id = _gmsh_axisym_uniform_cap_id(vertices)
-        is_free_interface = any(bool(getattr(v, "is_interface", False)) for v in vertices)
-        if (
-            bool(USER_CLAMP_INTERFACE_RADIUS_TO_CONTACT)
-            and cap_id is None
-            and is_free_interface
-        ):
-            coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-            rel = coords - mid[None, :]
-            axial = np.dot(rel, axis)
-            radial = rel - np.outer(axial, axis)
-            r_mean = float(np.mean(np.linalg.norm(radial, axis=1)))
-            if r_mean >= contact_radius_limit and ur > 0.0:
-                ur = 0.0
-        if (
-            bool(USER_CLAMP_INTERFACE_TO_CONTACT_SPAN)
-            and contact_bounds is not None
-            and is_free_interface
-            and cap_id is None
-        ):
-            coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-            center_axial = float(np.mean(np.dot(coords - mid[None, :], axis)))
-            lo, hi = contact_bounds
-            if (center_axial <= lo + span_margin and uz < 0.0) or (center_axial >= hi - span_margin and uz > 0.0):
-                uz = 0.0
-        for v, e_r in zip(vertices, units):
-            v.u = ur * e_r + uz * axis
-
-
-def _gmsh_axisymmetrize_state(state: VolumetricPitoisState) -> None:
-    if (not bool(USER_ENFORCE_FULL_AXISYMMETRY)) or (not bool(getattr(state, "gmsh_compute_mesh", False))):
-        return
-    _gmsh_axisymmetrize_geometry(state)
-    _gmsh_axisymmetrize_velocity_field(state)
-    _project_gmsh_contact_lines_to_spheres(state)
-    _set_cap_velocities(state)
-    _axisym_clear_caches(state)
-
-
-def _gmsh_axisym_force_map(
-    state: VolumetricPitoisState,
-    *,
-    pressure_model,
-    include_projected_pressure: bool,
-    include_contact_line: bool,
-    include_damping: bool,
-) -> dict[int, np.ndarray]:
-    if bool(getattr(state.config, "enable_incompressible_projection", False)):
-        include_projected_pressure = False
-    cache = getattr(state, "_gmsh_axisym_force_cache", {})
-    key = _axisym_force_cache_key(
-        state,
-        include_projected_pressure=include_projected_pressure,
-        include_contact_line=include_contact_line,
-        include_damping=include_damping,
-    )
-    if key in cache:
-        return cache[key]
-
-    free_vertices = [v for v in state.HC.V if v not in state.bV_caps]
-    raw_map = {
-        id(v): _BASE_Ftot(
-            v,
-            state=state,
-            pressure_model=pressure_model,
-            include_projected_pressure=include_projected_pressure,
-            include_contact_line=include_contact_line,
-            include_damping=include_damping,
-        )
-        for v in free_vertices
-    }
-    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
-    averaged: dict[int, np.ndarray] = {}
-    covered: set[int] = set()
-    for spec in getattr(state, "gmsh_axisym_ring_specs", []):
-        vertices = list(getattr(spec, "vertices", []))
-        units = _gmsh_axisym_spec_radial_units(spec, e1, e2)
-        pairs = [(v, e_r) for v, e_r in zip(vertices, units) if id(v) in raw_map]
-        if not pairs:
-            continue
-        _s_mean, r_mean = _gmsh_axisym_group_axial_radius(
-            [v for v, _e_r in pairs],
-            center_coord=mid,
-            axis=axis,
-        )
-        if len(pairs) == 1 or r_mean <= 1.0e-30:
-            force_z = float(np.mean([float(np.dot(raw_map[id(v)], axis)) for v, _e_r in pairs]))
-            for v, _e_r in pairs:
-                averaged[id(v)] = force_z * axis
-                covered.add(id(v))
-            continue
-        force_r = float(np.mean([float(np.dot(raw_map[id(v)], e_r)) for v, e_r in pairs]))
-        force_z = float(np.mean([float(np.dot(raw_map[id(v)], axis)) for v, _e_r in pairs]))
-        for v, e_r in pairs:
-            averaged[id(v)] = force_r * e_r + force_z * axis
-            covered.add(id(v))
-
-    for v in free_vertices:
-        vid = id(v)
-        if vid in covered:
-            continue
-        averaged[vid] = _remove_swirl_component(
-            raw_map[vid],
-            point=np.asarray(v.x_a[:3], dtype=float),
-            axis_origin=mid,
-            axis=axis,
-        )
-
-    cache[key] = averaged
-    state._gmsh_axisym_force_cache = cache
-    return averaged
-
-
-def _gmsh_axisym_accel_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
-    cache = getattr(state, "_gmsh_axisym_accel_cache", None)
-    if cache is not None:
-        return cache
-
-    pressure_model = lambda vv, HC=None, dim=3: _pressure_model(vv, HC=HC, dim=dim, state=state)
-    force_map_nonproj = _gmsh_axisym_force_map(
-        state,
-        pressure_model=pressure_model,
-        include_projected_pressure=False,
-        include_contact_line=True,
-        include_damping=True,
-    )
-    force_map_total = _gmsh_axisym_force_map(
-        state,
-        pressure_model=pressure_model,
-        include_projected_pressure=True,
-        include_contact_line=True,
-        include_damping=True,
-    )
-    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
-    cache = {}
-    covered: set[int] = set()
-    for spec in getattr(state, "gmsh_axisym_ring_specs", []):
-        vertices = list(getattr(spec, "vertices", []))
-        units = _gmsh_axisym_spec_radial_units(spec, e1, e2)
-        pairs = [
-            (v, e_r)
-            for v, e_r in zip(vertices, units)
-            if (v not in state.bV_caps) and (id(v) in force_map_nonproj)
-        ]
-        if not pairs:
-            continue
-        mass_avg = float(np.mean([max(float(getattr(v, "m", 0.0)), 1.0e-12) for v, _e_r in pairs]))
-        _s_mean, r_mean = _gmsh_axisym_group_axial_radius(
-            [v for v, _e_r in pairs],
-            center_coord=mid,
-            axis=axis,
-        )
-        if len(pairs) == 1 or r_mean <= 1.0e-30:
-            force_z_nonproj = float(np.mean([float(np.dot(force_map_nonproj[id(v)], axis)) for v, _e_r in pairs]))
-            force_z_proj = float(
-                np.mean(
-                    [
-                        float(np.dot(force_map_total[id(v)] - force_map_nonproj[id(v)], axis))
-                        for v, _e_r in pairs
-                    ]
-                )
-            )
-            accel = _clip_acceleration((force_z_nonproj / mass_avg) * axis, state) + (force_z_proj / mass_avg) * axis
-            accel = _clip_acceleration(accel, state)
-            for v, _e_r in pairs:
-                cache[id(v)] = accel
-                covered.add(id(v))
-            continue
-        force_r_nonproj = float(np.mean([float(np.dot(force_map_nonproj[id(v)], e_r)) for v, e_r in pairs]))
-        force_z_nonproj = float(np.mean([float(np.dot(force_map_nonproj[id(v)], axis)) for v, _e_r in pairs]))
-        force_r_proj = float(
-            np.mean(
-                [
-                    float(np.dot(force_map_total[id(v)] - force_map_nonproj[id(v)], e_r))
-                    for v, e_r in pairs
-                ]
-            )
-        )
-        force_z_proj = float(
-            np.mean(
-                [
-                    float(np.dot(force_map_total[id(v)] - force_map_nonproj[id(v)], axis))
-                    for v, _e_r in pairs
-                ]
-            )
-        )
-        for v, e_r in pairs:
-            accel_nonproj = (force_r_nonproj / mass_avg) * e_r + (force_z_nonproj / mass_avg) * axis
-            accel_proj = (force_r_proj / mass_avg) * e_r + (force_z_proj / mass_avg) * axis
-            cache[id(v)] = _clip_acceleration(_clip_acceleration(accel_nonproj, state) + accel_proj, state)
-            covered.add(id(v))
-
-    for v in [candidate for candidate in state.HC.V if (candidate not in state.bV_caps) and (id(candidate) in force_map_nonproj)]:
-        vid = id(v)
-        if vid in covered:
-            continue
-        mass = max(float(getattr(v, "m", 0.0)), 1.0e-12)
-        accel_nonproj = force_map_nonproj[vid] / mass
-        accel_proj = (force_map_total[vid] - force_map_nonproj[vid]) / mass
-        accel = _clip_acceleration(accel_nonproj, state) + _remove_swirl_component(
-            accel_proj,
-            point=np.asarray(v.x_a[:3], dtype=float),
-            axis_origin=mid,
-            axis=axis,
-        )
-        cache[vid] = _clip_acceleration(accel, state)
-    state._gmsh_axisym_accel_cache = cache
-    return cache
-
-
+_BASE_prepare_state = _prepare_state
 _BASE_update_duals_and_masses = _update_duals_and_masses
 _BASE_update_pressure_scalar = _update_pressure_scalar
 _BASE_update_pressure_projection_scalar = _update_pressure_projection_scalar
@@ -4007,28 +3333,6 @@ def _axisym_force_map(
 
 
 def _update_duals_and_masses(state: VolumetricPitoisState) -> None:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if hasattr(state, "_dual_area_vector_cache"):
-            delattr(state, "_dual_area_vector_cache")
-        vertices = list(state.volume_export_vertices)
-        points = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-        tets = np.asarray(state.volume_export_tets, dtype=int)
-        lumped = np.zeros(len(vertices), dtype=float)
-        for a, b, c, d in tets:
-            pa = points[int(a)]
-            pb = points[int(b)]
-            pc = points[int(c)]
-            pd = points[int(d)]
-            volume = abs(float(np.dot(pa - pd, np.cross(pb - pd, pc - pd))) / 6.0)
-            share = 0.25 * volume
-            lumped[int(a)] += share
-            lumped[int(b)] += share
-            lumped[int(c)] += share
-            lumped[int(d)] += share
-        for vertex, mass in zip(vertices, lumped):
-            vertex.m = max(float(mass), 1.0e-12)
-        _axisym_clear_caches(state)
-        return
     _BASE_update_duals_and_masses(state)
     _axisym_clear_caches(state)
 
@@ -4126,114 +3430,38 @@ def _update_pressure_projection_scalar(
     dt: float,
     refine: bool = True,
 ) -> None:
-    if bool(getattr(state.config, "enable_incompressible_projection", False)):
-        state.pressure_projection_scalar = 0.0
-        state.pressure_projection_area_map = {}
-        state.pressure_projection_normal_map = {}
-        _axisym_clear_caches(state)
-        return
     _BASE_update_pressure_projection_scalar(state, dt=dt)
-    if not np.isfinite(float(getattr(state, "pressure_projection_scalar", 0.0))):
-        state.pressure_projection_scalar = 0.0
-        state.pressure_projection_area_map = {}
-        state.pressure_projection_normal_map = {}
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        _axisym_clear_caches(state)
-        return
     if refine and bool(USER_ENABLE_PRESSURE_TRIAL_REFINEMENT):
         _refine_axisym_pressure_projection_scalar_by_trial(state, dt=dt)
     _axisym_clear_caches(state)
 
 
 def _prepare_state(config: VolumetricPitoisConfig) -> VolumetricPitoisState:
-    state = _prepare_gmsh_state(config)
-    print(f"Loaded initial .msh      = {HARDCODED_INITIAL_MSH_PATH}")
+    is_initialshape_builder = str(getattr(config, "name", "")) == "Case_2b_axisym_initialshape"
+    state = _BASE_prepare_state(config)
+    _axisymmetrize_full_geometry(state)
+    if not is_initialshape_builder:
+        _axisym_force_snapshot_volume_to_target(
+            state,
+            rel_tol=min(float(state.config.volume_projection_rel_tol), 1.0e-8),
+            max_iters=max(24, int(state.config.volume_projection_max_iters)),
+        )
+        _axisymmetrize_full_geometry(state)
+    _refresh_layer_fractions_from_current_profile(state)
+    _axisymmetrize_full_velocity_field(state)
+    _update_duals_and_masses(state)
+    _update_pressure_scalar(state)
     _axisym_clear_caches(state)
     return state
 
 
-def _project_gmsh_contact_lines_to_spheres(state: VolumetricPitoisState) -> None:
-    radius = float(state.config.particle_radius)
-    specs = (
-        (
-            state.bottom_contact_ring,
-            np.asarray(state.bottom_sphere_center, dtype=float),
-            np.array([0.0, 0.0, -float(state.config.cap_speed)], dtype=float),
-        ),
-        (
-            state.top_contact_ring,
-            np.asarray(state.top_sphere_center, dtype=float),
-            np.zeros(3, dtype=float),
-        ),
-    )
-    for ring, sphere_center, sphere_velocity in specs:
-        for v in ring:
-            old = np.asarray(v.x_a[:3], dtype=float)
-            rel = old - sphere_center
-            rel_norm = float(np.linalg.norm(rel))
-            if rel_norm <= 1.0e-30:
-                radial = np.array([1.0, 0.0, 0.0], dtype=float)
-            else:
-                radial = rel / rel_norm
-            target = sphere_center + radius * radial
-            _move(v, tuple(target), state.HC, state.bV_caps)
-            normal = (target - sphere_center) / max(radius, 1.0e-30)
-            rel_u = np.asarray(v.u[:3], dtype=float) - sphere_velocity
-            v.u = sphere_velocity + rel_u - float(np.dot(rel_u, normal)) * normal
-
-
 def _move_caps(state: VolumetricPitoisState, *, dt: float | None = None) -> None:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if dt is None:
-            dt = float(state.config.dt)
-        bottom_vel = np.array([0.0, 0.0, -float(state.config.cap_speed)], dtype=float)
-        top_vel = np.zeros(3, dtype=float)
-        bottom_disp = float(dt) * bottom_vel
-        top_disp = float(dt) * top_vel
-        if float(np.linalg.norm(bottom_disp)) <= 1.0e-30 and float(np.linalg.norm(top_disp)) <= 1.0e-30:
-            return
-        state.bottom_sphere_center = np.asarray(state.bottom_sphere_center, dtype=float) + bottom_disp
-        state.top_sphere_center = np.asarray(state.top_sphere_center, dtype=float) + top_disp
-        for v in state.cap_bottom_interior:
-            target = np.asarray(v.x_a[:3], dtype=float) + bottom_disp
-            _move(v, tuple(target), state.HC, state.bV_caps)
-            v.u = bottom_vel
-        for v in state.cap_top_interior:
-            target = np.asarray(v.x_a[:3], dtype=float) + top_disp
-            _move(v, tuple(target), state.HC, state.bV_caps)
-            v.u = top_vel
-        _axisym_clear_caches(state)
-        return
     _BASE_move_caps(state, dt=dt)
     _axisymmetrize_full_velocity_field(state)
     _axisym_clear_caches(state)
 
 
 def _update_moving_contact_line(state: VolumetricPitoisState, *, dt: float | None = None) -> None:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if dt is None:
-            dt = float(state.config.dt)
-        before_volume = float(_snapshot_msh_volume_m3(state))
-        prev_bottom_radius = float(_cap_radius(state.bottom_contact_ring)) if state.bottom_contact_ring else 0.0
-        prev_top_radius = float(_cap_radius(state.top_contact_ring)) if state.top_contact_ring else 0.0
-        _project_gmsh_contact_lines_to_spheres(state)
-        after_volume = float(_snapshot_msh_volume_m3(state))
-        bottom_radius = float(_cap_radius(state.bottom_contact_ring)) if state.bottom_contact_ring else 0.0
-        top_radius = float(_cap_radius(state.top_contact_ring)) if state.top_contact_ring else 0.0
-        sphere_radius = max(float(state.config.particle_radius), 1.0e-30)
-        if float(dt) > 0.0:
-            alpha_bottom_prev = float(np.arcsin(np.clip(prev_bottom_radius / sphere_radius, -1.0, 1.0)))
-            alpha_bottom_new = float(np.arcsin(np.clip(bottom_radius / sphere_radius, -1.0, 1.0)))
-            alpha_top_prev = float(np.arcsin(np.clip(prev_top_radius / sphere_radius, -1.0, 1.0)))
-            alpha_top_new = float(np.arcsin(np.clip(top_radius / sphere_radius, -1.0, 1.0)))
-            state.last_bottom_contact_line_speed = abs(sphere_radius * (alpha_bottom_new - alpha_bottom_prev) / float(dt))
-            state.last_top_contact_line_speed = abs(sphere_radius * (alpha_top_new - alpha_top_prev) / float(dt))
-        else:
-            state.last_bottom_contact_line_speed = 0.0
-            state.last_top_contact_line_speed = 0.0
-        state.last_contact_line_volume_delta_m3 = after_volume - before_volume
-        _axisym_clear_caches(state)
-        return
     before_volume = float(_snapshot_msh_volume_m3(state))
     _BASE_update_moving_contact_line(state, dt=dt)
     _axisymmetrize_full_geometry(state)
@@ -4244,28 +3472,9 @@ def _update_moving_contact_line(state: VolumetricPitoisState, *, dt: float | Non
 
 
 def _project_volume_to_target(state: VolumetricPitoisState) -> None:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if bool(getattr(state.config, "enable_gmsh_geometric_volume_correction", False)):
-            target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
-            current = float(_snapshot_msh_volume_m3(state))
-            trigger = max(float(getattr(state.config, "gmsh_geometric_volume_correction_trigger_rel", 0.0)), 0.0)
-            if (
-                np.isfinite(target)
-                and target > 0.0
-                and np.isfinite(current)
-                and abs(current - target) / max(target, 1.0e-30) > trigger
-            ):
-                _axisym_force_snapshot_volume_to_target(
-                    state,
-                    rel_tol=float(state.config.volume_projection_rel_tol),
-                    max_iters=max(1, int(state.config.volume_projection_max_iters)),
-                )
-                _gmsh_axisymmetrize_state(state)
-        _axisym_clear_caches(state)
-        return
     if bool(USER_ENFORCE_FULL_AXISYMMETRY):
-        # Axisymmetric non-Gmsh runs conserve volume through their force path,
-        # not by post-step geometric rescaling of the liquid bridge.
+        # Axisymmetric runs conserve volume through Fp,proj in Ftot, not by
+        # post-step geometric rescaling of the liquid bridge.
         _axisymmetrize_full_geometry(state)
         _axisymmetrize_full_velocity_field(state)
         _axisym_clear_caches(state)
@@ -4289,35 +3498,6 @@ def _Ftot(
 ) -> np.ndarray:
     if pressure_model is None:
         pressure_model = lambda vv, HC=None, dim=3: _pressure_model(vv, HC=HC, dim=dim, state=state)
-    if bool(getattr(state.config, "enable_incompressible_projection", False)):
-        include_projected_pressure = False
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if (v in state.bV_caps) or (not bool(USER_ENFORCE_FULL_AXISYMMETRY)):
-            return _BASE_Ftot(
-                v,
-                state=state,
-                pressure_model=pressure_model,
-                include_projected_pressure=include_projected_pressure,
-                include_contact_line=include_contact_line,
-                include_damping=include_damping,
-            )
-        force_map = _gmsh_axisym_force_map(
-            state,
-            pressure_model=pressure_model,
-            include_projected_pressure=include_projected_pressure,
-            include_contact_line=include_contact_line,
-            include_damping=include_damping,
-        )
-        if id(v) in force_map:
-            return np.asarray(force_map[id(v)], dtype=float)
-        return _BASE_Ftot(
-            v,
-            state=state,
-            pressure_model=pressure_model,
-            include_projected_pressure=include_projected_pressure,
-            include_contact_line=include_contact_line,
-            include_damping=include_damping,
-        )
     if (v in state.bV_caps) or (not bool(USER_ENFORCE_FULL_AXISYMMETRY)):
         return _BASE_Ftot(
             v,
@@ -4338,28 +3518,6 @@ def _Ftot(
 
 
 def _vertex_acceleration(v, *, state: VolumetricPitoisState) -> np.ndarray:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if v in state.bV_caps:
-            return np.zeros(3, dtype=float)
-        if bool(USER_ENFORCE_FULL_AXISYMMETRY):
-            return np.asarray(_gmsh_axisym_accel_map(state).get(id(v), np.zeros(3, dtype=float)), dtype=float)
-        mass = max(float(getattr(v, "m", 0.0)), 1.0e-12)
-        F_nonproj = _Ftot(v, state=state, include_projected_pressure=False)
-        accel = F_nonproj / mass
-        accel = _clip_acceleration(accel, state)
-        if bool(getattr(state.config, "enable_volume_projection", False)):
-            F_total = _Ftot(v, state=state, include_projected_pressure=True)
-            accel += (F_total - F_nonproj) / mass
-            accel = _clip_acceleration(accel, state)
-        if bool(getattr(state.config, "enforce_no_swirl", False)):
-            axis_origin, axis = _swirl_axis_geometry(state)
-            accel = _remove_swirl_component(
-                accel,
-                point=np.asarray(v.x_a[:3], dtype=float),
-                axis_origin=axis_origin,
-                axis=axis,
-            )
-        return accel
     if (v in state.bV_caps) or (not bool(USER_ENFORCE_FULL_AXISYMMETRY)):
         mass = max(float(getattr(v, "m", 0.0)), 1.0e-12)
         F_nonproj = _Ftot(v, state=state, include_projected_pressure=False)
@@ -4367,7 +3525,6 @@ def _vertex_acceleration(v, *, state: VolumetricPitoisState) -> np.ndarray:
         accel = _clip_acceleration(accel, state)
         if bool(getattr(state.config, "enable_volume_projection", False)):
             accel += _Fp_proj(v, state=state) / mass
-            accel = _clip_acceleration(accel, state)
         if bool(getattr(state.config, "enforce_no_swirl", False)):
             axis_origin, axis = _swirl_axis_geometry(state)
             accel = _remove_swirl_component(
@@ -4435,7 +3592,7 @@ def _vertex_acceleration(v, *, state: VolumetricPitoisState) -> np.ndarray:
                 for node, e_r in zip(members, radial_units):
                     accel_nonproj = (force_r_nonproj / mass_avg) * e_r + (force_z_nonproj / mass_avg) * axis
                     accel_proj = (force_r_proj / mass_avg) * e_r + (force_z_proj / mass_avg) * axis
-                    cache[id(node)] = _clip_acceleration(_clip_acceleration(accel_nonproj, state) + accel_proj, state)
+                    cache[id(node)] = _clip_acceleration(accel_nonproj, state) + accel_proj
                     covered.add(id(node))
 
             center_v = state.layer_centers[k]
@@ -4454,794 +3611,10 @@ def _vertex_acceleration(v, *, state: VolumetricPitoisState) -> np.ndarray:
             mass = max(float(getattr(node, "m", 0.0)), 1.0e-12)
             accel_nonproj = force_map_nonproj[vid] / mass
             accel_proj = (force_map_total[vid] - force_map_nonproj[vid]) / mass
-            cache[vid] = _clip_acceleration(_clip_acceleration(accel_nonproj, state) + accel_proj, state)
+            cache[vid] = _clip_acceleration(accel_nonproj, state) + accel_proj
         state._axisym_accel_cache = cache
 
     return np.asarray(cache.get(id(v), np.zeros(3, dtype=float)), dtype=float)
-
-
-def _tet_volume_and_shape_grads(tet_points: np.ndarray) -> tuple[float, np.ndarray] | None:
-    x = np.ones((4, 4), dtype=float)
-    x[:, 1:] = np.asarray(tet_points, dtype=float)
-    det = float(np.linalg.det(x))
-    volume = abs(det) / 6.0
-    if (not np.isfinite(volume)) or volume <= 1.0e-30:
-        return None
-    try:
-        inv_x = np.linalg.inv(x)
-    except np.linalg.LinAlgError:
-        return None
-    grads = np.asarray(inv_x[1:, :].T, dtype=float)
-    if not np.all(np.isfinite(grads)):
-        return None
-    return volume, grads
-
-
-def _gmsh_tet_divergence_l2(state: VolumetricPitoisState) -> float:
-    vertices = list(getattr(state, "volume_export_vertices", []))
-    tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
-    if (not vertices) or tets.size == 0:
-        return 0.0
-
-    _project_gmsh_contact_line_velocities_to_sphere_tangents(state)
-    _set_cap_velocities(state)
-    points = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-    velocities = np.asarray([np.asarray(v.u[:3], dtype=float) for v in vertices], dtype=float)
-    weighted = 0.0
-    volume_sum = 0.0
-    for tet in tets:
-        idx = np.asarray(tet, dtype=int)
-        result = _tet_volume_and_shape_grads(points[idx])
-        if result is None:
-            continue
-        volume, grads = result
-        div_u = float(np.sum(np.einsum("ij,ij->i", velocities[idx], grads)))
-        if not np.isfinite(div_u):
-            continue
-        weighted += volume * div_u * div_u
-        volume_sum += volume
-    if volume_sum <= 1.0e-30:
-        return 0.0
-    return float(math.sqrt(max(weighted / volume_sum, 0.0)))
-
-
-def _project_gmsh_contact_line_velocities_to_sphere_tangents(state: VolumetricPitoisState) -> None:
-    radius = float(state.config.particle_radius)
-    specs = (
-        (
-            state.bottom_contact_ring,
-            np.asarray(state.bottom_sphere_center, dtype=float),
-            np.array([0.0, 0.0, -float(state.config.cap_speed)], dtype=float),
-        ),
-        (
-            state.top_contact_ring,
-            np.asarray(state.top_sphere_center, dtype=float),
-            np.zeros(3, dtype=float),
-        ),
-    )
-    for ring, sphere_center, sphere_velocity in specs:
-        for v in ring:
-            normal = np.asarray(v.x_a[:3], dtype=float) - sphere_center
-            normal_norm = float(np.linalg.norm(normal))
-            if normal_norm <= 1.0e-30:
-                continue
-            normal = normal / normal_norm
-            rel_u = np.asarray(v.u[:3], dtype=float) - sphere_velocity
-            v.u = sphere_velocity + rel_u - float(np.dot(rel_u, normal)) * normal
-
-
-def _apply_gmsh_incompressible_projection(state: VolumetricPitoisState, *, dt: float) -> None:
-    if (
-        (not bool(getattr(state, "gmsh_compute_mesh", False)))
-        or (not bool(getattr(state.config, "enable_incompressible_projection", False)))
-        or float(dt) <= 0.0
-    ):
-        return
-    if coo_matrix is None or diags is None or spsolve is None:
-        raise RuntimeError("USER_ENABLE_INCOMPRESSIBLE_PROJECTION requires scipy.sparse.")
-
-    vertices = list(getattr(state, "volume_export_vertices", []))
-    tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
-    if (not vertices) or tets.size == 0:
-        return
-
-    _project_gmsh_contact_line_velocities_to_sphere_tangents(state)
-    _set_cap_velocities(state)
-    points = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
-    velocities = np.asarray([np.asarray(v.u[:3], dtype=float) for v in vertices], dtype=float)
-    if (not np.all(np.isfinite(points))) or (not np.all(np.isfinite(velocities))):
-        return
-
-    n_vertices = len(vertices)
-    n_dofs = 3 * n_vertices
-    g_rows: list[int] = []
-    g_cols: list[int] = []
-    g_data: list[float] = []
-    lumped = np.zeros(n_vertices, dtype=float)
-    tet_cache: list[tuple[int, np.ndarray, float, np.ndarray]] = []
-
-    for cell_idx, tet in enumerate(tets):
-        idx = np.asarray(tet, dtype=int)
-        result = _tet_volume_and_shape_grads(points[idx])
-        if result is None:
-            continue
-        volume, grads = result
-        row_scale = math.sqrt(max(volume, 1.0e-30))
-        tet_cache.append((int(cell_idx), idx, volume, grads))
-        lumped[idx] += 0.25 * volume
-
-    if not tet_cache:
-        return
-
-    def divergence_l2_from_velocity_array(velocity_array: np.ndarray) -> float:
-        weighted = 0.0
-        volume_sum = 0.0
-        for _cell_idx, idx, volume, grads in tet_cache:
-            div_u = float(np.sum(np.einsum("ij,ij->i", velocity_array[idx], grads)))
-            if not np.isfinite(div_u):
-                continue
-            weighted += float(volume) * div_u * div_u
-            volume_sum += float(volume)
-        if volume_sum <= 1.0e-30:
-            return 0.0
-        return float(math.sqrt(max(weighted / volume_sum, 0.0)))
-
-    for cell_idx, idx, volume, grads in tet_cache:
-        row_scale = math.sqrt(max(volume, 1.0e-30))
-        for a_local, ia in enumerate(idx):
-            base = 3 * int(ia)
-            for component in range(3):
-                g_rows.append(base + component)
-                g_cols.append(int(cell_idx))
-                g_data.append(row_scale * float(grads[a_local, component]))
-
-    def tangent_projector(vertex) -> np.ndarray:
-        if vertex in state.bottom_contact_ring:
-            center = np.asarray(state.bottom_sphere_center, dtype=float)
-        elif vertex in state.top_contact_ring:
-            center = np.asarray(state.top_sphere_center, dtype=float)
-        else:
-            return np.eye(3, dtype=float)
-        normal = np.asarray(vertex.x_a[:3], dtype=float) - center
-        normal_norm = float(np.linalg.norm(normal))
-        if normal_norm <= 1.0e-30:
-            return np.eye(3, dtype=float)
-        normal = normal / normal_norm
-        return np.eye(3, dtype=float) - np.outer(normal, normal)
-
-    w_rows: list[int] = []
-    w_cols: list[int] = []
-    w_data: list[float] = []
-    fixed = set(state.bV_caps)
-    for idx, v in enumerate(vertices):
-        if v in fixed or lumped[idx] <= 1.0e-30:
-            continue
-        inv_mass = 1.0 / max(float(lumped[idx]), 1.0e-30)
-        projector = tangent_projector(v)
-        base = 3 * idx
-        for a in range(3):
-            for b in range(3):
-                value = inv_mass * float(projector[a, b])
-                if abs(value) > 0.0:
-                    w_rows.append(base + a)
-                    w_cols.append(base + b)
-                    w_data.append(value)
-
-    state.incompressible_divergence_before_l2 = float(divergence_l2_from_velocity_array(velocities))
-    g_matrix = coo_matrix((g_data, (g_rows, g_cols)), shape=(n_dofs, int(tets.shape[0]))).tocsr()
-    mobility = coo_matrix((w_data, (w_rows, w_cols)), shape=(n_dofs, n_dofs)).tocsr()
-    velocity_vec = velocities.reshape(n_dofs)
-    rhs = np.asarray(g_matrix.T @ velocity_vec, dtype=float)
-    matrix = (g_matrix.T @ mobility @ g_matrix).tocsr()
-    diag_mean = float(np.mean(np.abs(matrix.diagonal()))) if n_vertices else 1.0
-    diag_mean = max(diag_mean, 1.0e-30)
-    damping = max(float(getattr(state.config, "incompressible_projection_regularization", 0.0)), 0.0)
-    if damping > 0.0:
-        matrix = matrix + diags(
-            np.full(int(tets.shape[0]), damping * diag_mean, dtype=float),
-            0,
-            shape=(int(tets.shape[0]), int(tets.shape[0])),
-        )
-    n_cells = int(tets.shape[0])
-    volume_lambda = 0.0
-    volume_gradient = np.zeros(n_dofs, dtype=float)
-    use_global_volume_constraint = False
-    target_volume = float(getattr(state, "target_snapshot_volume_m3", 0.0))
-    if target_volume > 0.0:
-        volume_gradient = _indexed_tet_volume_gradient(points, tets).reshape(n_dofs)
-        volume_mobility_gradient = np.asarray(mobility @ volume_gradient, dtype=float)
-        volume_metric = float(np.dot(volume_gradient, volume_mobility_gradient))
-        current_volume = float(_indexed_tet_mesh_volume_m3(points, tets))
-        if (
-            np.isfinite(volume_metric)
-            and volume_metric > 1.0e-30
-            and np.isfinite(current_volume)
-        ):
-            target_volume_rate = (target_volume - current_volume) / max(float(dt), 1.0e-30)
-            volume_rhs = float(np.dot(volume_gradient, velocity_vec) - target_volume_rate)
-            coupling = np.asarray(g_matrix.T @ volume_mobility_gradient, dtype=float).reshape(n_cells)
-            matrix_coo = matrix.tocoo()
-            aug_rows = list(map(int, matrix_coo.row))
-            aug_cols = list(map(int, matrix_coo.col))
-            aug_data = list(map(float, matrix_coo.data))
-            for cell_idx, value in enumerate(coupling):
-                if abs(float(value)) <= 0.0:
-                    continue
-                aug_rows.append(cell_idx)
-                aug_cols.append(n_cells)
-                aug_data.append(float(value))
-                aug_rows.append(n_cells)
-                aug_cols.append(cell_idx)
-                aug_data.append(float(value))
-            aug_rows.append(n_cells)
-            aug_cols.append(n_cells)
-            aug_data.append(float(volume_metric))
-            matrix_aug = coo_matrix(
-                (aug_data, (aug_rows, aug_cols)),
-                shape=(n_cells + 1, n_cells + 1),
-            ).tocsr()
-            rhs_aug = np.concatenate([rhs, np.asarray([volume_rhs], dtype=float)])
-            solution_aug = np.asarray(spsolve(matrix_aug, rhs_aug), dtype=float)
-            if solution_aug.size == n_cells + 1 and np.all(np.isfinite(solution_aug)):
-                pressure = solution_aug[:n_cells]
-                volume_lambda = float(solution_aug[-1])
-                use_global_volume_constraint = True
-            else:
-                pressure = np.asarray(spsolve(matrix, rhs), dtype=float)
-        else:
-            pressure = np.asarray(spsolve(matrix, rhs), dtype=float)
-    else:
-        pressure = np.asarray(spsolve(matrix, rhs), dtype=float)
-    if pressure.size != n_cells or not np.all(np.isfinite(pressure)):
-        pressure = np.nan_to_num(pressure, nan=0.0, posinf=0.0, neginf=0.0)
-        volume_lambda = 0.0
-        use_global_volume_constraint = False
-    state.incompressible_projection_pressure = pressure
-    state.incompressible_projection_volume_lambda = float(volume_lambda)
-    state.incompressible_projection_uses_global_volume_constraint = bool(use_global_volume_constraint)
-
-    correction_source = np.asarray(g_matrix @ pressure, dtype=float)
-    if use_global_volume_constraint:
-        correction_source = correction_source + float(volume_lambda) * volume_gradient
-    correction = np.asarray(mobility @ correction_source, dtype=float)
-    alpha = 1.0
-    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
-    node_id_map = dict(getattr(state, "volume_export_node_ids", {}))
-    interface_fraction_bounds = _gmsh_interface_fraction_bounds(state)
-
-    def trial_contact_bounds(trial_points: np.ndarray) -> tuple[float, float] | None:
-        centers: list[float] = []
-        for ring in (state.bottom_contact_ring, state.top_contact_ring):
-            point_indices = [node_id_map.get(id(vertex)) for vertex in ring]
-            if not point_indices or any(idx is None for idx in point_indices):
-                continue
-            coords = trial_points[[int(idx) for idx in point_indices]]
-            centers.append(float(np.mean(np.dot(coords - mid[None, :], axis))))
-        if len(centers) != 2:
-            return None
-        return min(centers), max(centers)
-
-    def apply_trial_axisymmetry(trial_points: np.ndarray) -> None:
-        radius = float(state.config.particle_radius)
-        contact_bounds = trial_contact_bounds(trial_points)
-        span_margin = max(1.0e-9, 1.0e-6 * radius)
-        contact_radius_limit = max(
-            _cap_radius(state.bottom_contact_ring),
-            _cap_radius(state.top_contact_ring),
-            1.0e-30,
-        ) * 1.001
-        for spec in getattr(state, "gmsh_axisym_ring_specs", []):
-            spec_vertices = list(getattr(spec, "vertices", []))
-            point_indices = [node_id_map.get(id(vertex)) for vertex in spec_vertices]
-            if not point_indices or any(idx is None for idx in point_indices):
-                continue
-            point_indices = [int(idx) for idx in point_indices]
-            coords = trial_points[point_indices]
-            rel = coords - mid[None, :]
-            axial = np.dot(rel, axis)
-            radial = rel - np.outer(axial, axis)
-            r_mean = float(np.mean(np.linalg.norm(radial, axis=1)))
-            cap_id = _gmsh_axisym_uniform_cap_id(spec_vertices)
-            is_free_interface = any(bool(getattr(v, "is_interface", False)) for v in spec_vertices)
-            if (
-                bool(USER_CLAMP_INTERFACE_RADIUS_TO_CONTACT)
-                and cap_id is None
-                and is_free_interface
-            ):
-                r_mean = float(np.clip(r_mean, 0.0, contact_radius_limit))
-            if cap_id is None:
-                center_axial = float(np.mean(axial))
-                if (
-                    bool(USER_CLAMP_INTERFACE_TO_CONTACT_SPAN)
-                    and contact_bounds is not None
-                    and is_free_interface
-                ):
-                    lo, hi = contact_bounds
-                    if bool(USER_PRESERVE_INTERFACE_AXIAL_ORDER):
-                        frac_bounds = interface_fraction_bounds.get(id(spec))
-                        if frac_bounds is not None:
-                            f_lo, f_hi = frac_bounds
-                            center_axial = float(
-                                np.clip(center_axial, lo + f_lo * (hi - lo), lo + f_hi * (hi - lo))
-                            )
-                    if hi - lo > 2.0 * span_margin:
-                        center_axial = float(np.clip(center_axial, lo + span_margin, hi - span_margin))
-                    else:
-                        center_axial = float(np.clip(center_axial, lo, hi))
-                center_coord = mid + center_axial * axis
-            else:
-                sphere_center = (
-                    np.asarray(state.bottom_sphere_center, dtype=float)
-                    if cap_id == "bottom"
-                    else np.asarray(state.top_sphere_center, dtype=float)
-                )
-                sign = 1.0 if cap_id == "bottom" else -1.0
-                r_mean = float(np.clip(r_mean, 0.0, radius))
-                center_coord = sphere_center + sign * math.sqrt(max(radius * radius - r_mean * r_mean, 0.0)) * axis
-            angles = tuple(getattr(spec, "angles", ()))
-            if len(point_indices) == 1 or r_mean <= 1.0e-30:
-                for point_idx in point_indices:
-                    trial_points[point_idx] = center_coord
-            else:
-                for point_idx, angle in zip(point_indices, angles):
-                    e_r = float(np.cos(angle)) * e1 + float(np.sin(angle)) * e2
-                    trial_points[point_idx] = center_coord + r_mean * e_r
-
-    def apply_trial_contact_projection(trial_points: np.ndarray) -> None:
-        radius = float(state.config.particle_radius)
-        for ring, sphere_center in (
-            (state.bottom_contact_ring, np.asarray(state.bottom_sphere_center, dtype=float)),
-            (state.top_contact_ring, np.asarray(state.top_sphere_center, dtype=float)),
-        ):
-            for vertex in ring:
-                point_idx = node_id_map.get(id(vertex))
-                if point_idx is None:
-                    continue
-                point_idx = int(point_idx)
-                rel = trial_points[point_idx] - sphere_center
-                rel_norm = float(np.linalg.norm(rel))
-                if rel_norm <= 1.0e-30:
-                    continue
-                trial_points[point_idx] = sphere_center + radius * (rel / rel_norm)
-
-    def predicted_step_volume(alpha_value: float) -> float:
-        trial_points = points.copy()
-        trial_velocity = (velocity_vec - float(alpha_value) * correction).reshape((n_vertices, 3))
-        for vertex_idx, vertex in enumerate(vertices):
-            if vertex in fixed:
-                continue
-            trial_points[vertex_idx] = trial_points[vertex_idx] + float(dt) * trial_velocity[vertex_idx]
-        # Match the coordinate constraints applied immediately after the real
-        # move: axisymmetric ring projection and contact-line projection.
-        for _projection_pass in range(2):
-            apply_trial_axisymmetry(trial_points)
-            apply_trial_contact_projection(trial_points)
-        return _indexed_tet_mesh_volume_m3(trial_points, tets)
-
-    if target_volume > 0.0:
-        candidates: list[tuple[float, float]] = []
-
-        def add_candidate(alpha_value: float) -> tuple[float, float] | None:
-            if not np.isfinite(alpha_value):
-                return None
-            alpha_value = float(alpha_value)
-            volume_value = predicted_step_volume(alpha_value)
-            if not np.isfinite(volume_value):
-                return None
-            pair = (alpha_value, float(volume_value))
-            candidates.append(pair)
-            return pair
-
-        volume_tol = max(1.0e-8 * target_volume, 1.0e-30)
-        previous_alpha_pair = add_candidate(float(getattr(state, "incompressible_projection_alpha", 1.0)))
-        vol1_pair = add_candidate(1.0)
-        if previous_alpha_pair is not None and vol1_pair is not None:
-            denom = vol1_pair[1] - previous_alpha_pair[1]
-            if abs(denom) > max(1.0e-18 * target_volume, 1.0e-30):
-                add_candidate(
-                    previous_alpha_pair[0]
-                    + (target_volume - previous_alpha_pair[1])
-                    * (vol1_pair[0] - previous_alpha_pair[0])
-                    / denom
-                )
-        vol0_pair = None
-
-        prelim_candidates = [
-            (candidate_alpha, candidate_volume)
-            for candidate_alpha, candidate_volume in candidates
-            if np.isfinite(candidate_alpha) and np.isfinite(candidate_volume)
-        ]
-        prelim_best = (
-            min(prelim_candidates, key=lambda item: abs(item[1] - target_volume))
-            if prelim_candidates
-            else None
-        )
-        needs_bracket = prelim_best is None or abs(prelim_best[1] - target_volume) > volume_tol
-        if needs_bracket:
-            vol0_pair = add_candidate(0.0)
-            if vol0_pair is not None and vol1_pair is not None:
-                denom = vol1_pair[1] - vol0_pair[1]
-                if abs(denom) > max(1.0e-18 * target_volume, 1.0e-30):
-                    add_candidate((target_volume - vol0_pair[1]) / denom)
-            for alpha_endpoint in (-2.0, 2.0, -5.0, 5.0, -10.0, 10.0, -20.0, 20.0):
-                add_candidate(alpha_endpoint)
-
-            bracket: tuple[tuple[float, float], tuple[float, float]] | None = None
-            for span in (50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0):
-                sorted_candidates = sorted(candidates, key=lambda item: item[0])
-                for left, right in zip(sorted_candidates[:-1], sorted_candidates[1:]):
-                    f_left = left[1] - target_volume
-                    f_right = right[1] - target_volume
-                    if f_left == 0.0:
-                        bracket = (left, left)
-                        break
-                    if f_left * f_right <= 0.0:
-                        bracket = (left, right)
-                        break
-                if bracket is not None:
-                    break
-                add_candidate(-span)
-                add_candidate(span)
-
-            if bracket is not None:
-                left, right = bracket
-                if left[0] == right[0]:
-                    add_candidate(left[0])
-                else:
-                    lo_alpha, lo_volume = left
-                    hi_alpha, hi_volume = right
-                    lo_f = lo_volume - target_volume
-                    hi_f = hi_volume - target_volume
-                    for _root_iter in range(32):
-                        mid_alpha = 0.5 * (lo_alpha + hi_alpha)
-                        mid_volume = predicted_step_volume(mid_alpha)
-                        if not np.isfinite(mid_volume):
-                            break
-                        candidates.append((mid_alpha, float(mid_volume)))
-                        mid_f = mid_volume - target_volume
-                        if abs(mid_f) <= max(1.0e-10 * target_volume, 1.0e-30):
-                            break
-                        if lo_f * mid_f <= 0.0:
-                            hi_alpha, hi_volume, hi_f = mid_alpha, float(mid_volume), float(mid_f)
-                        else:
-                            lo_alpha, lo_volume, lo_f = mid_alpha, float(mid_volume), float(mid_f)
-        finite_candidates = [
-            (candidate_alpha, candidate_volume)
-            for candidate_alpha, candidate_volume in candidates
-            if np.isfinite(candidate_alpha) and np.isfinite(candidate_volume)
-        ]
-        if finite_candidates:
-            alpha = min(finite_candidates, key=lambda item: abs(item[1] - target_volume))[0]
-    state.incompressible_projection_alpha = float(alpha)
-
-    projected_velocity = velocity_vec - float(alpha) * correction
-    if not np.all(np.isfinite(projected_velocity)):
-        projected_velocity = np.nan_to_num(projected_velocity, nan=0.0, posinf=0.0, neginf=0.0)
-    projected_velocity = projected_velocity.reshape((n_vertices, 3))
-    for idx, v in enumerate(vertices):
-        if v in fixed:
-            continue
-        v.u = projected_velocity[idx]
-
-    _project_gmsh_contact_line_velocities_to_sphere_tangents(state)
-    _set_cap_velocities(state)
-    final_velocities = np.asarray([np.asarray(v.u[:3], dtype=float) for v in vertices], dtype=float)
-    state.incompressible_divergence_after_l2 = float(divergence_l2_from_velocity_array(final_velocities))
-    _axisym_clear_caches(state)
-
-
-def _apply_gmsh_position_volume_constraint(state: VolumetricPitoisState) -> None:
-    if (
-        (not bool(getattr(state, "gmsh_compute_mesh", False)))
-        or (not bool(getattr(state.config, "enable_incompressible_projection", False)))
-        or (not bool(USER_ENABLE_POSITION_VOLUME_CONSTRAINT))
-    ):
-        return
-    target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
-    if (not np.isfinite(target)) or target <= 0.0:
-        return
-    current = float(_snapshot_msh_volume_m3(state))
-    if (not np.isfinite(current)) or current <= 0.0:
-        return
-    trigger = max(float(USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL), 0.0)
-    if abs(current - target) / max(target, 1.0e-30) <= trigger:
-        return
-
-    vertices = list(getattr(state, "volume_export_vertices", []))
-    tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
-    if (not vertices) or tets.size == 0:
-        return
-    fixed = set(state.bV_caps)
-    max_disp = 0.02 * max(float(state.config.particle_radius), 1.0e-30)
-
-    def tangent_projector(vertex) -> np.ndarray:
-        if vertex in state.bottom_contact_ring:
-            center = np.asarray(state.bottom_sphere_center, dtype=float)
-        elif vertex in state.top_contact_ring:
-            center = np.asarray(state.top_sphere_center, dtype=float)
-        else:
-            return np.eye(3, dtype=float)
-        normal = np.asarray(vertex.x_a[:3], dtype=float) - center
-        normal_norm = float(np.linalg.norm(normal))
-        if normal_norm <= 1.0e-30:
-            return np.eye(3, dtype=float)
-        normal = normal / normal_norm
-        return np.eye(3, dtype=float) - np.outer(normal, normal)
-
-    for _iter in range(max(1, int(USER_POSITION_VOLUME_CONSTRAINT_MAX_ITERS))):
-        points = _volume_points_array(state)
-        current = float(_indexed_tet_mesh_volume_m3(points, tets))
-        if (not np.isfinite(current)) or current <= 0.0:
-            return
-        if abs(current - target) / max(target, 1.0e-30) <= trigger:
-            return
-
-        tet_points = points[tets]
-        pa = tet_points[:, 0, :]
-        pb = tet_points[:, 1, :]
-        pc = tet_points[:, 2, :]
-        pd = tet_points[:, 3, :]
-        tet_volumes = np.abs(np.einsum("ij,ij->i", pa - pd, np.cross(pb - pd, pc - pd))) / 6.0
-        lumped = np.zeros(len(vertices), dtype=float)
-        for local in range(4):
-            np.add.at(lumped, tets[:, local], 0.25 * tet_volumes)
-
-        gradient = _indexed_tet_volume_gradient(points, tets)
-        direction = np.zeros_like(points, dtype=float)
-        for idx, vertex in enumerate(vertices):
-            if vertex in fixed or lumped[idx] <= 1.0e-30:
-                continue
-            direction[idx] = (tangent_projector(vertex) @ gradient[idx]) / max(float(lumped[idx]), 1.0e-30)
-
-        derivative = float(np.sum(gradient * direction))
-        if (not np.isfinite(derivative)) or abs(derivative) <= 1.0e-30:
-            return
-        scale = (target - current) / derivative
-        displacement = scale * direction
-        disp_norms = np.linalg.norm(displacement, axis=1)
-        max_norm = float(np.max(disp_norms)) if disp_norms.size else 0.0
-        if max_norm > max_disp:
-            displacement *= max_disp / max(max_norm, 1.0e-30)
-
-        movable_vertices: list[object] = []
-        targets: list[tuple[float, float, float]] = []
-        for idx, vertex in enumerate(vertices):
-            if vertex in fixed:
-                continue
-            target_pos = points[idx] + displacement[idx]
-            if np.all(np.isfinite(target_pos)):
-                movable_vertices.append(vertex)
-                targets.append(tuple(float(x) for x in target_pos))
-        if not movable_vertices:
-            return
-        before = abs(current - target)
-        old_positions = points.copy()
-        _move_vertices_batch(movable_vertices, targets, state.HC, state.bV_caps)
-        _gmsh_axisymmetrize_state(state)
-        after = abs(float(_snapshot_msh_volume_m3(state)) - target)
-        if after >= before:
-            _move_vertices_batch(vertices, [tuple(float(x) for x in row) for row in old_positions], state.HC, state.bV_caps)
-            _gmsh_axisymmetrize_state(state)
-            return
-
-
-def _gmsh_contact_ring_radius_and_angles(
-    ring: list,
-    sphere_center: np.ndarray,
-    axis: np.ndarray,
-    e1: np.ndarray,
-    e2: np.ndarray,
-) -> tuple[float, list[float]]:
-    if not ring:
-        return 0.0, []
-    radii: list[float] = []
-    angles: list[float] = []
-    for vertex in ring:
-        rel = np.asarray(vertex.x_a[:3], dtype=float) - sphere_center
-        axial = float(np.dot(rel, axis))
-        radial = rel - axial * axis
-        radius = float(np.linalg.norm(radial))
-        radii.append(radius)
-        if radius <= 1.0e-30:
-            angles.append(0.0)
-        else:
-            angles.append(float(np.arctan2(float(np.dot(radial, e2)), float(np.dot(radial, e1)))))
-    return float(np.mean(radii)), angles
-
-
-def _move_gmsh_contact_ring_radius(
-    state: VolumetricPitoisState,
-    ring: list,
-    *,
-    sphere_center: np.ndarray,
-    radius_value: float,
-    sign: float,
-    axis: np.ndarray,
-    e1: np.ndarray,
-    e2: np.ndarray,
-    angles: list[float],
-) -> None:
-    sphere_radius = float(state.config.particle_radius)
-    radius_value = float(np.clip(radius_value, 0.0, sphere_radius))
-    axial = math.sqrt(max(sphere_radius * sphere_radius - radius_value * radius_value, 0.0))
-    targets = []
-    for angle in angles:
-        e_r = float(np.cos(angle)) * e1 + float(np.sin(angle)) * e2
-        targets.append(tuple(sphere_center + sign * axial * axis + radius_value * e_r))
-    _move_vertices_batch(ring, targets, state.HC, state.bV_caps)
-
-
-def _apply_gmsh_contact_line_volume_slide(state: VolumetricPitoisState, *, dt: float | None = None) -> None:
-    if (
-        (not bool(getattr(state, "gmsh_compute_mesh", False)))
-        or (not bool(USER_ENABLE_CONTACT_LINE_VOLUME_SLIDE))
-        or (not bool(getattr(state.config, "allow_contact_line_growth", True)))
-    ):
-        return
-    target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
-    current = float(_snapshot_msh_volume_m3(state))
-    if (not np.isfinite(target)) or target <= 0.0 or (not np.isfinite(current)) or current <= 0.0:
-        return
-    trigger = max(float(USER_CONTACT_LINE_VOLUME_SLIDE_TRIGGER_REL), 0.0)
-    if abs(current - target) / max(target, 1.0e-30) <= trigger:
-        return
-
-    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
-    del mid
-    bottom_center = np.asarray(state.bottom_sphere_center, dtype=float)
-    top_center = np.asarray(state.top_sphere_center, dtype=float)
-    bottom_radius, bottom_angles = _gmsh_contact_ring_radius_and_angles(state.bottom_contact_ring, bottom_center, axis, e1, e2)
-    top_radius, top_angles = _gmsh_contact_ring_radius_and_angles(state.top_contact_ring, top_center, axis, e1, e2)
-    if bottom_radius <= 1.0e-30 or top_radius <= 1.0e-30:
-        return
-
-    vertices = list(state.volume_export_vertices)
-    base_positions = _volume_points_array(state)
-    base_bottom_radius = float(bottom_radius)
-    base_top_radius = float(top_radius)
-    sphere_radius = float(state.config.particle_radius)
-    min_fraction = float(np.clip(USER_CONTACT_LINE_VOLUME_SLIDE_MIN_RADIUS_FRACTION, 1.0e-6, 1.0))
-    max_fraction = float(max(USER_CONTACT_LINE_VOLUME_SLIDE_MAX_RADIUS_FRACTION, 1.0))
-
-    def restore() -> None:
-        _move_vertices_batch(vertices, [tuple(float(x) for x in row) for row in base_positions], state.HC, state.bV_caps)
-        _gmsh_axisymmetrize_state(state)
-
-    def apply_scale(scale: float) -> float:
-        _move_gmsh_contact_ring_radius(
-            state,
-            state.bottom_contact_ring,
-            sphere_center=bottom_center,
-            radius_value=base_bottom_radius * float(scale),
-            sign=1.0,
-            axis=axis,
-            e1=e1,
-            e2=e2,
-            angles=bottom_angles,
-        )
-        _move_gmsh_contact_ring_radius(
-            state,
-            state.top_contact_ring,
-            sphere_center=top_center,
-            radius_value=base_top_radius * float(scale),
-            sign=-1.0,
-            axis=axis,
-            e1=e1,
-            e2=e2,
-            angles=top_angles,
-        )
-        _gmsh_axisymmetrize_state(state)
-        return float(_snapshot_msh_volume_m3(state))
-
-    if current > target:
-        low = min_fraction
-        high = 1.0
-        vol_low = apply_scale(low)
-        restore()
-        if (not np.isfinite(vol_low)) or vol_low > target:
-            return
-    else:
-        low = 1.0
-        high = min(max_fraction, sphere_radius / max(base_bottom_radius, base_top_radius, 1.0e-30))
-        if high <= 1.0:
-            return
-        vol_high = apply_scale(high)
-        restore()
-        if (not np.isfinite(vol_high)) or vol_high < target:
-            return
-
-    best_scale = 1.0
-    best_error = abs(current - target)
-    for _iter in range(24):
-        scale = 0.5 * (low + high)
-        volume = apply_scale(scale)
-        error = abs(volume - target) if np.isfinite(volume) else float("inf")
-        if error < best_error:
-            best_error = error
-            best_scale = scale
-        restore()
-        if error / max(target, 1.0e-30) <= trigger:
-            break
-        if current > target:
-            if volume < target:
-                low = scale
-            else:
-                high = scale
-        else:
-            if volume < target:
-                low = scale
-            else:
-                high = scale
-
-    old_bottom = base_bottom_radius
-    old_top = base_top_radius
-    apply_scale(best_scale)
-    new_bottom = base_bottom_radius * float(best_scale)
-    new_top = base_top_radius * float(best_scale)
-    if dt is not None and float(dt) > 0.0:
-        state.last_bottom_contact_line_speed = abs(new_bottom - old_bottom) / float(dt)
-        state.last_top_contact_line_speed = abs(new_top - old_top) / float(dt)
-
-
-def _advance_gmsh_incompressible_substep(state: VolumetricPitoisState, *, dt: float) -> bool:
-    if (
-        (not bool(getattr(state, "gmsh_compute_mesh", False)))
-        or (not bool(getattr(state.config, "enable_incompressible_projection", False)))
-    ):
-        return False
-
-    _set_cap_velocities(state)
-    _enforce_no_swirl_velocity_field(state)
-    _move_caps(state, dt=dt)
-    _gmsh_axisymmetrize_state(state)
-    _update_duals_and_masses(state)
-    _update_pressure_scalar(state)
-    _update_pressure_projection_scalar(state, dt=dt)
-
-    free_vertices = [v for v in state.HC.V if v not in state.bV_caps]
-    accel_by_id: dict[int, np.ndarray] = {}
-    for v in free_vertices:
-        accel_by_id[id(v)] = _clip_acceleration(_vertex_acceleration(v, state=state), state)
-
-    for v in free_vertices:
-        u_new = np.asarray(v.u[:3], dtype=float) + float(dt) * accel_by_id.get(id(v), np.zeros(3, dtype=float))
-        v.u = np.nan_to_num(u_new, nan=0.0, posinf=0.0, neginf=0.0)
-
-    _enforce_no_swirl_velocity_field(state)
-    _set_cap_velocities(state)
-    _apply_gmsh_incompressible_projection(state, dt=dt)
-    _set_cap_velocities(state)
-
-    moving_vertices: list[object] = []
-    targets: list[tuple[float, float, float]] = []
-    for v in free_vertices:
-        if v in state.bV_caps:
-            continue
-        target = np.asarray(v.x_a[:3], dtype=float) + float(dt) * np.asarray(v.u[:3], dtype=float)
-        if not np.all(np.isfinite(target)):
-            continue
-        moving_vertices.append(v)
-        targets.append(tuple(float(x) for x in target))
-    _move_vertices_batch(moving_vertices, targets, state.HC, state.bV_caps)
-    _axisym_clear_caches(state)
-
-    _gmsh_axisymmetrize_state(state)
-    _enforce_no_swirl_velocity_field(state)
-    _set_cap_velocities(state)
-    _update_moving_contact_line(state, dt=dt)
-    _gmsh_axisymmetrize_state(state)
-    _enforce_no_swirl_velocity_field(state)
-    _assert_fixed_topology(state)
-    _project_volume_to_target(state)
-    _apply_gmsh_contact_line_volume_slide(state, dt=dt)
-    _apply_gmsh_position_volume_constraint(state)
-    _gmsh_axisymmetrize_state(state)
-    _assert_fixed_topology(state)
-    _update_duals_and_masses(state)
-    _update_pressure_scalar(state)
-    _update_pressure_projection_scalar(state, dt=dt, refine=False)
-    _assert_fixed_topology(state)
-    return True
 
 
 def _cap_force(cap_vertices: list, *, state: VolumetricPitoisState) -> np.ndarray:
@@ -5305,10 +3678,7 @@ def _cap_traction_force(
         sigma_tri = np.zeros((3, 3), dtype=float)
         for vtx in (va, vb, vc):
             p_v = float(pressure_model(vtx)) + p_proj
-            if bool(getattr(state, "gmsh_compute_mesh", False)):
-                du_v = np.zeros((3, 3), dtype=float)
-            else:
-                du_v = velocity_difference_tensor_pointwise(vtx, state.HC, dim=3)
+            du_v = velocity_difference_tensor_pointwise(vtx, state.HC, dim=3)
             sigma_tri += cauchy_stress(p_v, du_v, mu, dim=3)
         sigma_tri /= 3.0
         Fcap += sigma_tri @ n_s * area
@@ -5454,55 +3824,7 @@ def _quad_triangles_consistent_diagonal(
     )
 
 
-def _gmsh_boundary_face_triangle_indices(state: VolumetricPitoisState) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    cached = getattr(state, "_gmsh_boundary_face_triangle_cache", None)
-    if cached is not None:
-        return cached
-    tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
-    vertices = list(getattr(state, "volume_export_vertices", []))
-    if (not vertices) or tets.size == 0:
-        empty = np.empty((0, 3), dtype=int)
-        cached = (empty, empty, empty)
-        state._gmsh_boundary_face_triangle_cache = cached
-        return cached
-
-    face_map: dict[tuple[int, int, int], list[int]] = {}
-    for tet in tets:
-        a, b, c, d = [int(i) for i in tet]
-        for face in ((a, b, c), (a, d, b), (a, c, d), (b, d, c)):
-            key = tuple(sorted(face))
-            if key in face_map:
-                face_map[key] = []
-            else:
-                face_map[key] = [int(face[0]), int(face[1]), int(face[2])]
-
-    side: list[list[int]] = []
-    bottom: list[list[int]] = []
-    top: list[list[int]] = []
-    for face in face_map.values():
-        if len(face) != 3:
-            continue
-        cap_ids = {getattr(vertices[int(idx)], "cap_id", None) for idx in face}
-        if cap_ids == {"bottom"}:
-            bottom.append(face)
-        elif cap_ids == {"top"}:
-            top.append(face)
-        else:
-            side.append(face)
-
-    cached = (
-        np.asarray(side, dtype=int) if side else np.empty((0, 3), dtype=int),
-        np.asarray(bottom, dtype=int) if bottom else np.empty((0, 3), dtype=int),
-        np.asarray(top, dtype=int) if top else np.empty((0, 3), dtype=int),
-    )
-    state._gmsh_boundary_face_triangle_cache = cached
-    return cached
-
-
 def _actual_compute_side_surface_triangles(state: VolumetricPitoisState) -> np.ndarray:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        side, _bottom, _top = _gmsh_boundary_face_triangle_indices(state)
-        return _surface_triangles_xyz_from_indices(state, side)
     if state.surface_export_side_tris.size:
         return _surface_triangles_xyz_from_indices(state, state.surface_export_side_tris)
     ordered_rings = _ordered_outer_rings_for_surface(state)
@@ -5529,12 +3851,6 @@ def _actual_compute_side_surface_triangles(state: VolumetricPitoisState) -> np.n
 
 
 def _actual_compute_cap_triangles(state: VolumetricPitoisState) -> tuple[np.ndarray, np.ndarray]:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        _side, bottom, top = _gmsh_boundary_face_triangle_indices(state)
-        return (
-            _surface_triangles_xyz_from_indices(state, bottom),
-            _surface_triangles_xyz_from_indices(state, top),
-        )
     if state.surface_export_bottom_cap_tris.size or state.surface_export_top_cap_tris.size:
         return (
             _surface_triangles_xyz_from_indices(state, state.surface_export_bottom_cap_tris),
@@ -5748,64 +4064,21 @@ def _side_surface_with_contact_rings(state: VolumetricPitoisState):
     return surface, bottom_ring, top_ring
 
 
-def _ring_surface_tension_force(ring: list, *, gamma: float, state: VolumetricPitoisState | None = None) -> np.ndarray:
+def _ring_surface_tension_force(ring: list, *, gamma: float) -> np.ndarray:
     if not ring:
         return np.zeros(3, dtype=float)
-    if state is not None and bool(getattr(state, "gmsh_compute_mesh", False)):
-        force_map = _gmsh_surface_heron_force_map(state)
-        return np.sum(
-            [np.asarray(force_map.get(id(v), np.zeros(3, dtype=float)), dtype=float) for v in ring],
-            axis=0,
-        )
     return np.sum(
         [surface_tension_force(v, gamma=gamma, dim=3) for v in ring],
         axis=0,
     )
 
 
-def _gorge_pressure_cap_forces(state: VolumetricPitoisState) -> tuple[np.ndarray, np.ndarray]:
-    bottom_center, top_center, axis = _particle_centers_physical(state)
-    waist_ring = min(
-        [ring for ring in state.outer_rings if ring],
-        key=lambda ring: float(_cap_radius(ring)),
-        default=[],
-    )
-    if not waist_ring:
-        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
-
-    waist_radius = float(_cap_radius(waist_ring))
-    waist_center = np.mean([np.asarray(v.x_a[:3], dtype=float) for v in waist_ring], axis=0)
-    pressure = float(state.pressure_scalar)
-    if state.config.include_gravity:
-        z_ref = 0.5 * float(bottom_center[2] + top_center[2])
-        pressure -= float(state.config.rho_f) * float(state.config.gravity_mps2) * (float(waist_center[2]) - z_ref)
-    pressure += float(getattr(state, "pressure_projection_scalar", 0.0))
-
-    pressure_force = pressure * np.pi * waist_radius * waist_radius * axis
-    return pressure_force, -pressure_force
-
-
 def _sphere_total_forces(state: VolumetricPitoisState) -> dict[str, np.ndarray]:
-    if bool(getattr(state, "gmsh_compute_mesh", False)):
-        _bottom_center, _top_center, axis = _particle_centers_physical(state)
-        top_cap, bottom_cap = _gorge_pressure_cap_forces(state)
-        top_line = -_ring_surface_tension_force(state.top_contact_ring, gamma=state.config.gamma, state=state)
-        bottom_line = -_ring_surface_tension_force(state.bottom_contact_ring, gamma=state.config.gamma, state=state)
-        top_line = float(np.dot(top_line, axis)) * axis
-        bottom_line = float(np.dot(bottom_line, axis)) * axis
-        return {
-            "top_total": top_cap + top_line,
-            "bottom_total": bottom_cap + bottom_line,
-            "top_cap": top_cap,
-            "bottom_cap": bottom_cap,
-            "top_line": top_line,
-            "bottom_line": bottom_line,
-        }
     top_cap = _cap_traction_force(state, which="top")
     bottom_cap = _cap_traction_force(state, which="bottom")
     _surface, bottom_ring, top_ring = _side_surface_with_contact_rings(state)
-    top_line = _ring_surface_tension_force(top_ring, gamma=state.config.gamma, state=state)
-    bottom_line = _ring_surface_tension_force(bottom_ring, gamma=state.config.gamma, state=state)
+    top_line = _ring_surface_tension_force(top_ring, gamma=state.config.gamma)
+    bottom_line = _ring_surface_tension_force(bottom_ring, gamma=state.config.gamma)
     return {
         "top_total": top_cap + top_line,
         "bottom_total": bottom_cap + bottom_line,
@@ -5853,7 +4126,7 @@ def _min_mesh_edge_length(state: VolumetricPitoisState) -> float:
 
 def _select_physical_dt(state: VolumetricPitoisState) -> float:
     config = state.config
-    if float(config.dt) > 0.0 and not bool(getattr(config, "enable_adaptive_dt", False)):
+    if float(config.dt) > 0.0:
         dt_fixed = float(config.dt)
         state.last_dt_limit_cl = dt_fixed
         state.last_dt_limit_capillary = dt_fixed
@@ -5863,11 +4136,7 @@ def _select_physical_dt(state: VolumetricPitoisState) -> float:
         return dt_fixed
 
     if not bool(getattr(config, "enable_adaptive_dt", False)):
-        dt_fallback = max(
-            float(config.dt),
-            float(getattr(config, "adaptive_dt_max_s", 0.0)),
-            1.0e-12,
-        )
+        dt_fallback = max(float(getattr(config, "adaptive_dt_max_s", 0.0)), 1.0e-12)
         state.last_dt_limit_cl = dt_fallback
         state.last_dt_limit_capillary = dt_fallback
         state.last_dt_limit_mesh = dt_fallback
@@ -5875,7 +4144,8 @@ def _select_physical_dt(state: VolumetricPitoisState) -> float:
         state.last_step_dt = dt_fallback
         return dt_fallback
 
-    dt_min = max(float(getattr(config, "adaptive_dt_min_s", 0.0)), 1.0e-12)
+    dt_min = max(float(getattr(config, "adaptive_dt_min_s", 0.0)), 1.0e-8)
+    dt_max = max(float(getattr(config, "adaptive_dt_max_s", 0.0)), dt_min)
     slide_limit = max(float(config.contact_line_max_slide_um) * 1.0e-6, 1.0e-12)
     cl_speed_ref = max(
         abs(float(state.last_bottom_contact_line_speed)),
@@ -5906,14 +4176,8 @@ def _select_physical_dt(state: VolumetricPitoisState) -> float:
         "contact_line": float(dt_cl),
         "capillary": float(dt_capillary),
         "mesh": float(dt_mesh),
+        "dt_ceiling": float(dt_max),
     }
-    configured_ceiling = (
-        float(config.dt)
-        if float(config.dt) > 0.0
-        else float(getattr(config, "adaptive_dt_max_s", 0.0))
-    )
-    if configured_ceiling > 0.0:
-        limiter_map["dt_ceiling"] = max(float(configured_ceiling), dt_min)
     dt_selected = min(limiter_map.values())
     limiter = min(limiter_map, key=limiter_map.get)
     if dt_selected < dt_min:
@@ -6619,39 +4883,17 @@ def _indexed_tet_mesh_volume_m3(points: np.ndarray, tets: np.ndarray) -> float:
     tet_idx = np.asarray(tets, dtype=int)
     if pts.size == 0 or tet_idx.size == 0:
         return 0.0
-    tet_points = pts[tet_idx]
-    pa = tet_points[:, 0, :]
-    pb = tet_points[:, 1, :]
-    pc = tet_points[:, 2, :]
-    pd = tet_points[:, 3, :]
-    # Physical volumetric .msh volume is the sum of positive tetra volumes.
-    # Never rely on cancellation from mixed element orientation.
-    triple = np.einsum("ij,ij->i", pa - pd, np.cross(pb - pd, pc - pd))
-    return float(np.sum(np.abs(triple)) / 6.0)
 
-
-def _indexed_tet_volume_gradient(points: np.ndarray, tets: np.ndarray) -> np.ndarray:
-    pts = np.asarray(points, dtype=float)
-    tet_idx = np.asarray(tets, dtype=int)
-    gradient = np.zeros_like(pts, dtype=float)
-    if pts.size == 0 or tet_idx.size == 0:
-        return gradient
-    tet_points = pts[tet_idx]
-    pa = tet_points[:, 0, :]
-    pb = tet_points[:, 1, :]
-    pc = tet_points[:, 2, :]
-    pd = tet_points[:, 3, :]
-    triple = np.einsum("ij,ij->i", pa - pd, np.cross(pb - pd, pc - pd))
-    signed_scale = (np.sign(triple) / 6.0)[:, None]
-    grad_a = signed_scale * np.cross(pb - pd, pc - pd)
-    grad_b = signed_scale * np.cross(pc - pd, pa - pd)
-    grad_c = signed_scale * np.cross(pa - pd, pb - pd)
-    grad_d = -(grad_a + grad_b + grad_c)
-    np.add.at(gradient, tet_idx[:, 0], grad_a)
-    np.add.at(gradient, tet_idx[:, 1], grad_b)
-    np.add.at(gradient, tet_idx[:, 2], grad_c)
-    np.add.at(gradient, tet_idx[:, 3], grad_d)
-    return gradient
+    volume = 0.0
+    for a, b, c, d in tet_idx:
+        pa = pts[int(a)]
+        pb = pts[int(b)]
+        pc = pts[int(c)]
+        pd = pts[int(d)]
+        # Physical volumetric .msh volume is the sum of positive tetra volumes.
+        # Never rely on cancellation from mixed element orientation.
+        volume += abs(float(np.dot(pa - pd, np.cross(pb - pd, pc - pd))) / 6.0)
+    return float(volume)
 
 
 def _snapshot_msh_volume_m3(
@@ -6778,11 +5020,8 @@ def _save_mesh_snapshot_tet_volume_csv(
 
 def _set_axes_equal(ax, xyz: np.ndarray, centers: list[np.ndarray], radius: float) -> None:
     pts = np.asarray(xyz.reshape(-1, 3), dtype=float) if xyz.size else np.empty((0, 3), dtype=float)
-    if pts.size:
-        pts = pts[np.all(np.isfinite(pts), axis=1)]
     if centers:
         centers_arr = np.asarray(centers, dtype=float)
-        centers_arr = centers_arr[np.all(np.isfinite(centers_arr), axis=1)]
         sphere_bbox = []
         for center in centers_arr:
             sphere_bbox.extend(
@@ -6795,8 +5034,7 @@ def _set_axes_equal(ax, xyz: np.ndarray, centers: list[np.ndarray], radius: floa
                     center + np.array([0.0, 0.0, -radius], dtype=float),
                 ]
             )
-        if sphere_bbox:
-            pts = np.vstack([pts, centers_arr, np.asarray(sphere_bbox, dtype=float)])
+        pts = np.vstack([pts, centers_arr, np.asarray(sphere_bbox, dtype=float)])
     if pts.size == 0:
         pts = np.zeros((1, 3), dtype=float)
     mins = pts.min(axis=0)
@@ -6820,8 +5058,6 @@ def _set_axes_equal(ax, xyz: np.ndarray, centers: list[np.ndarray], radius: floa
         z_center = float(center[2])
 
     half_span = max(x_half, z_half)
-    if not np.isfinite(half_span) or half_span <= 0.0:
-        half_span = 1.0
     ax.set_xlim(x_center - half_span, x_center + half_span)
     ax.set_ylim(center[1] - half_span, center[1] + half_span)
     ax.set_zlim(z_center - half_span, z_center + half_span)
@@ -6992,7 +5228,7 @@ def _render_history_figures(
     if not history:
         return []
 
-    fig_dir = out_dir / "fig"
+    fig_dir = out_dir
     fig_dir.mkdir(parents=True, exist_ok=True)
 
     t_ms = np.array([float(row["t"]) * 1.0e3 for row in history], dtype=float)
@@ -7076,25 +5312,11 @@ def _render_motion_mesh_pngs(
     else:
         filename = f"mesh_iter{step:04d}.png"
     title = _snapshot_title(state, label=label if label in {"initial", "final"} else f"iteration {step}")
-    out_png = _render_mesh_snapshot(state, title, motion_dir / filename)
-    if label == "initial":
-        initial_source = Path(getattr(state, "loaded_initial_msh_path", _required_initial_msh_path()))
-        if initial_source.resolve() != _required_initial_msh_path().resolve():
-            raise RuntimeError(f"Initial output must come from mesh_iter0012.msh, got {initial_source}")
-        iter0_png = motion_dir / "mesh_iter0000.png"
-        shutil.copyfile(out_png, iter0_png)
-        for suffix in (".msh",):
-            source = out_png.with_suffix(suffix)
-            if source.exists():
-                shutil.copyfile(source, iter0_png.with_suffix(suffix))
-        source_csv = out_png.with_name(f"{out_png.stem}_tet_volumes.csv")
-        if source_csv.exists():
-            shutil.copyfile(source_csv, iter0_png.with_name(f"{iter0_png.stem}_tet_volumes.csv"))
-    return out_png
+    return _render_mesh_snapshot(state, title, motion_dir / filename)
 
 
 def _save_history(history: list[dict], config: VolumetricPitoisConfig, out_dir: Path) -> Path:
-    results_dir = out_dir / "results"
+    results_dir = out_dir
     results_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": asdict(config),
@@ -7258,12 +5480,9 @@ def _advance_state(state: VolumetricPitoisState, *, n_steps: int) -> None:
         substeps = max(1, int(state.config.integration_substeps))
         sub_dt = float(step_dt) / float(substeps)
         for _substep in range(substeps):
-            if _advance_gmsh_incompressible_substep(state, dt=sub_dt):
-                continue
             _set_cap_velocities(state)
             _enforce_no_swirl_velocity_field(state)
             _move_caps(state, dt=sub_dt)
-            _gmsh_axisymmetrize_state(state)
             _update_duals_and_masses(state)
             _update_pressure_scalar(state)
             _update_pressure_projection_scalar(state, dt=sub_dt)
@@ -7278,21 +5497,17 @@ def _advance_state(state: VolumetricPitoisState, *, n_steps: int) -> None:
                 workers=max(1, int(state.config.accel_workers)),
                 state=state,
             )
-            _gmsh_axisymmetrize_state(state)
             _enforce_no_swirl_velocity_field(state)
             _set_cap_velocities(state)
             _update_moving_contact_line(state, dt=sub_dt)
-            _gmsh_axisymmetrize_state(state)
             _enforce_no_swirl_velocity_field(state)
             _assert_fixed_topology(state)
             _project_volume_to_target(state)
-            _gmsh_axisymmetrize_state(state)
             _assert_fixed_topology(state)
             _update_duals_and_masses(state)
             _update_pressure_scalar(state)
             _update_pressure_projection_scalar(state, dt=sub_dt, refine=False)
             _assert_fixed_topology(state)
-        _assert_state_finite(state, where=f"advance step {_step + 1}")
         state.elapsed_time_s += float(step_dt)
 
 
@@ -7513,28 +5728,34 @@ def _write_pitois_fig5_comparison(
     separation_history: list[dict],
     out_dir: Path,
 ) -> None:
-    fig_dir = out_dir / "fig"
-    results_dir = out_dir / "results"
+    fig_dir = out_dir
+    results_dir = out_dir
     fig_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
     separation = _history_arrays(separation_history)
     exp_x, exp_y = _pitois_fig5_dynamic_digitized()
-    compare_mask = np.array(
-        [int(row.get("step", 0)) > int(USER_FIG5_COMPARE_SKIP_INITIAL_STEPS) for row in separation_history],
-        dtype=bool,
-    )
-    if not np.any(compare_mask):
-        compare_mask = np.ones_like(separation["d_over_r"], dtype=bool)
 
+    _refresh_pitois_fig5_compare_png(separation_history=separation_history, out_dir=out_dir)
     _save_pitois_fig5_compare(
         exp_x=exp_x,
         exp_y=exp_y,
-        sim_x=separation["d_over_r"][compare_mask],
-        sim_y=separation["force_abs_mn"][compare_mask],
-        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare.png",
-        xlim=(0.01, 0.30),
-        ylim=(0.02, 2.0),
+        sim_x=separation["d_over_r"],
+        sim_y=separation["force_abs_mn"],
+        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare_zoom.png",
+        xlim=(0.095, 0.110),
+        ylim=(1.0e-4, 2.0),
+        title="Pitois 2000 Fig. 5: zoom on the Case_2b_axisym overlap range",
+    )
+    _save_pitois_fig5_compare(
+        exp_x=exp_x,
+        exp_y=exp_y,
+        sim_x=separation["d_over_r"],
+        sim_y=separation["force_abs_mn"],
+        out_path=fig_dir / "pitois2000_volumetric_separation_digitized_compare_tail_zoom.png",
+        xlim=(0.13, 0.23),
+        ylim=(0.035, 0.15),
+        title="Pitois 2000 Fig. 5: digitized dynamic tail zoom",
     )
     _save_case2b_histories_panel(
         separation=separation,
@@ -7547,17 +5768,6 @@ def _write_pitois_fig5_comparison(
             "d_over_r_max": float(np.max(separation["d_over_r"])),
             "force_abs_mn_min": float(np.min(separation["force_abs_mn"])),
             "force_abs_mn_max": float(np.max(separation["force_abs_mn"])),
-            "fig5_compare_skip_initial_steps": int(USER_FIG5_COMPARE_SKIP_INITIAL_STEPS),
-            "fig5_compare_first_plotted_step": int(
-                separation_history[int(np.flatnonzero(compare_mask)[0])]["step"]
-                if np.any(compare_mask)
-                else separation_history[0]["step"]
-            ),
-            "fig5_compare_note": (
-                "The imported t=0/near-start geometry is calibrated to the Fig. 5 setup; "
-                "the main comparison omits those near-start rows so the red curve shows "
-                "post-advance computed dynamics only."
-            ),
         },
         "digitized_fig5_dynamic": {
             "d_over_r": exp_x.tolist(),
@@ -7574,6 +5784,26 @@ def _write_pitois_fig5_comparison(
             },
             indent=2,
         )
+    )
+
+
+def _refresh_pitois_fig5_compare_png(
+    *,
+    separation_history: list[dict],
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    separation = _history_arrays(separation_history)
+    exp_x, exp_y = _pitois_fig5_dynamic_digitized()
+
+    _save_pitois_fig5_compare(
+        exp_x=exp_x,
+        exp_y=exp_y,
+        sim_x=separation["d_over_r"],
+        sim_y=separation["force_abs_mn"],
+        out_path=out_dir / "pitois2000_volumetric_separation_digitized_compare.png",
+        xlim=(0.01, 0.30),
+        ylim=(0.02, 2.0),
     )
 
 
@@ -7606,9 +5836,7 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
     print("Moving sphere             = bottom sphere (stage side)")
     print(f"Integration substeps      = {config.integration_substeps}")
     print(f"Contact-radius samples    = {config.contact_radius_samples}")
-    if bool(getattr(config, "enable_incompressible_projection", False)):
-        projection_label = "velocity-pressure projection on Gmsh tets"
-    elif bool(USER_ENFORCE_FULL_AXISYMMETRY):
+    if bool(USER_ENFORCE_FULL_AXISYMMETRY):
         projection_label = (
             "Fp,proj force only (no geometric projector)"
             if config.enable_volume_projection
@@ -7617,33 +5845,22 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
     else:
         projection_label = "on" if config.enable_volume_projection else "off"
     print(f"Volume projection         = {projection_label}")
-    print(
-        "Fp,proj trial refinement  = "
-        f"{'off (replaced by incompressible projection)' if config.enable_incompressible_projection else ('on' if USER_ENABLE_PRESSURE_TRIAL_REFINEMENT else 'off')}"
-    )
+    print(f"Fp,proj trial refinement  = {'on' if USER_ENABLE_PRESSURE_TRIAL_REFINEMENT else 'off'}")
     print(f"No-swirl enforcement      = {'on' if config.enforce_no_swirl else 'off'}")
-    if config.dt > 0.0 and not config.enable_adaptive_dt:
+    if config.dt > 0.0:
         print("Adaptive dt               = off (using USER_DT_S)")
         print(f"dt                        = {config.dt:.3e} s")
     else:
         print(f"Adaptive dt               = {'on' if config.enable_adaptive_dt else 'off'}")
-        dt_ceiling = float(config.dt) if float(config.dt) > 0.0 else float(config.adaptive_dt_max_s)
-        if dt_ceiling > 0.0:
-            print(f"dt ceiling                = {dt_ceiling:.3e} s")
-        else:
-            print("dt ceiling                = none (USER_DT_S < 0: right_dt)")
+        print(f"dt ceiling                = {config.adaptive_dt_max_s:.3e} s")
         print(f"dt floor                  = {config.adaptive_dt_min_s:.3e} s")
         print(f"Capillary dt safety       = {config.adaptive_dt_capillary_safety:.3f}")
         print(f"Mesh disp. fraction       = {config.adaptive_dt_mesh_displacement_frac:.3f}")
     print(f"Steps                     = {config.n_steps}")
-    if config.dt > 0.0 and not config.enable_adaptive_dt:
+    if config.dt > 0.0:
         print(f"Run time                  = {config.dt * config.n_steps:.3f} s")
     else:
-        dt_ceiling = float(config.dt) if float(config.dt) > 0.0 else float(config.adaptive_dt_max_s)
-        if dt_ceiling > 0.0:
-            print(f"Run time ceiling          = {dt_ceiling * config.n_steps:.3f} s")
-        else:
-            print("Run time ceiling          = adaptive/no fixed ceiling")
+        print(f"Run time ceiling          = {config.adaptive_dt_max_s * config.n_steps:.3f} s")
     print("=" * 72)
 
 
@@ -7678,26 +5895,21 @@ def run_motion_case(
     _assert_fixed_topology(state)
     target_snapshot_volume_ul = 1.0e9 * float(state.target_snapshot_volume_m3)
     history: list[dict] = []
-    fig_dir = out_dir / "fig"
+    fig_dir = out_dir
     fig_dir.mkdir(parents=True, exist_ok=True)
-    motion_mesh_dir = fig_dir / "separation"
+    motion_mesh_dir = out_dir
 
     if save_fig:
         _render_motion_mesh_pngs(state, motion_dir=motion_mesh_dir, label="initial", step=0)
 
-    final_completed_step = 0
-    stop_reason: str | None = None
     for step in range(config.n_steps):
         step_dt = _select_physical_dt(state)
         substeps = max(1, int(config.integration_substeps))
         sub_dt = float(step_dt) / float(substeps)
         for _substep in range(substeps):
-            if _advance_gmsh_incompressible_substep(state, dt=sub_dt):
-                continue
             _set_cap_velocities(state)
             _enforce_no_swirl_velocity_field(state)
             _move_caps(state, dt=sub_dt)
-            _gmsh_axisymmetrize_state(state)
             _update_duals_and_masses(state)
             _update_pressure_scalar(state)
             _update_pressure_projection_scalar(state, dt=sub_dt)
@@ -7712,30 +5924,20 @@ def run_motion_case(
                 workers=max(1, int(state.config.accel_workers)),
                 state=state,
             )
-            _gmsh_axisymmetrize_state(state)
             _enforce_no_swirl_velocity_field(state)
             _set_cap_velocities(state)
             _update_moving_contact_line(state, dt=sub_dt)
-            _gmsh_axisymmetrize_state(state)
             _enforce_no_swirl_velocity_field(state)
             _assert_fixed_topology(state)
             _project_volume_to_target(state)
-            _gmsh_axisymmetrize_state(state)
             _assert_fixed_topology(state)
             _update_duals_and_masses(state)
             _update_pressure_scalar(state)
             _update_pressure_projection_scalar(state, dt=sub_dt, refine=False)
             _assert_fixed_topology(state)
-        completed_step = step + 1
-        stop_reason = _gmsh_numerical_rupture_reason(state)
-        if stop_reason is None:
-            _assert_state_finite(state, where=f"step {completed_step}")
         state.elapsed_time_s += float(step_dt)
 
-        final_completed_step = completed_step
-        record_row = None
-        if verbose or completed_step % max(1, config.record_every) == 0:
-            record_row = _step_record(state, step=completed_step, t=state.elapsed_time_s)
+        completed_step = step + 1
         if verbose:
             snapshot_volume_ul = 1.0e9 * _snapshot_msh_volume_m3(state)
             rel_snapshot_volume_error = (snapshot_volume_ul - target_snapshot_volume_ul) / max(
@@ -7757,39 +5959,19 @@ def run_motion_case(
                 f"Water-filled mesh volume  = {snapshot_volume_ul:.6f} uL",
                 flush=True,
             )
-            if record_row is not None:
-                print(
-                    "F each step              = "
-                    f"fixed_axial {1.0e3 * float(record_row['fixed_force_axial']):+.6e} mN, "
-                    f"moving_axial {1.0e3 * float(record_row['moving_force_axial']):+.6e} mN, "
-                    f"|fixed| {1.0e3 * float(record_row['fixed_force_mag']):.6e} mN, "
-                    f"|moving| {1.0e3 * float(record_row['moving_force_mag']):.6e} mN",
-                    flush=True,
-                )
-                print(
-                    "CL slide speed           = "
-                    f"bottom {float(record_row['bottom_contact_line_speed']):.6e} m/s, "
-                    f"top {float(record_row['top_contact_line_speed']):.6e} m/s",
-                    flush=True,
-                )
-                if bool(getattr(state.config, "enable_incompressible_projection", False)):
-                    print(
-                        "Div(u) projection L2     = "
-                        f"{float(state.incompressible_divergence_before_l2):.6e} -> "
-                        f"{float(state.incompressible_divergence_after_l2):.6e} 1/s",
-                        flush=True,
-                    )
+        latest_record = None
         if completed_step % max(1, config.record_every) == 0:
-            history.append(record_row if record_row is not None else _step_record(state, step=completed_step, t=state.elapsed_time_s))
-
-        if stop_reason is not None:
-            if record_row is None:
-                record_row = _step_record(state, step=completed_step, t=state.elapsed_time_s)
-            if not history or int(history[-1]["step"]) != completed_step:
-                history.append(record_row)
-            if verbose:
-                print(f"Stopping separation       = {stop_reason}", flush=True)
-            break
+            latest_record = _step_record(state, step=completed_step, t=state.elapsed_time_s)
+            history.append(latest_record)
+        if save_fig:
+            compare_history = history
+            if latest_record is None:
+                latest_record = _step_record(state, step=completed_step, t=state.elapsed_time_s)
+                compare_history = [*history, latest_record]
+            _refresh_pitois_fig5_compare_png(
+                separation_history=compare_history,
+                out_dir=out_dir,
+            )
 
         if interactive_step is not None and completed_step == max(0, int(interactive_step)):
             _show_state_interactive(
@@ -7811,15 +5993,13 @@ def run_motion_case(
                 step=completed_step,
             )
 
-    if final_completed_step <= 0:
-        final_completed_step = int(config.n_steps)
     if config.n_steps > 0:
-        final_step = int(final_completed_step)
+        final_step = int(config.n_steps)
         if not history or int(history[-1]["step"]) != final_step:
             history.append(_step_record(state, step=final_step, t=state.elapsed_time_s))
 
     if save_fig:
-        _render_motion_mesh_pngs(state, motion_dir=motion_mesh_dir, label="final", step=final_completed_step)
+        _render_motion_mesh_pngs(state, motion_dir=motion_mesh_dir, label="final", step=config.n_steps)
         _render_history_figures(
             history,
             config,

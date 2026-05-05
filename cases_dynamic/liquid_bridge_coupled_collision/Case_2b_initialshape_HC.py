@@ -108,8 +108,9 @@ USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP = 0
 USER_INTERFACE_NECK_EXTRA_AXIAL_LAYERS = (
     2 * USER_INTERFACE_NECK_REFINEMENT_GAPS * USER_INTERFACE_NECK_EXTRA_RINGS_PER_GAP
 )
-# Generate six HyperCT .msh sets and exit instead of doing the slow relaxation.
-USER_GENERATE_MESH_LEVEL_SETS = True
+# Recovered HC run mode for the saved mesh_iter0100.msh:
+# run the 100-iteration HyperCT initial-shape relaxation and write fig/mesh_iter0100.msh.
+USER_GENERATE_MESH_LEVEL_SETS = False
 USER_MESH_LEVEL_ORDER = (
     "fine",
     "medium_fine",

@@ -146,7 +146,7 @@ USER_CL_EXTRA_AXIAL_LAYERS = 6
 USER_CL_RADIAL_BIAS_RATIO = 1.1
 # Max separation iterations. Keep at 1 for the requested smoke check; increase
 # here when you want a longer Fig. 5 sweep.
-USER_TOTAL_STEPS = 20000
+USER_TOTAL_STEPS = 1500
 # Time-step rule:
 #   USER_DT_S > 0: fixed user step.
 #   USER_DT_S < 0: physical step, dt = min(dt_CL, dt_capillary, dt_mesh).
