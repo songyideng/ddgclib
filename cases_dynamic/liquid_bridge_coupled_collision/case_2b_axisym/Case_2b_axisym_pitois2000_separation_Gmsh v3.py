@@ -2,7 +2,7 @@
 
 This file owns plotting, .msh/CSV/JSON output, Fig. 5 digitized experiment
 data, CLI printing, and interactive viewing.  Computation is imported from
-``solver_v2.py``.
+``solver_v3.py``.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from matplotlib.ticker import FuncFormatter, NullFormatter
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 import numpy as np
 
-from solver_v2 import *
+from solver_v3 import *
 
 OUT_ROOT = Path(__file__).resolve().parent / Path(__file__).stem
 
@@ -874,12 +874,36 @@ def _save_output_csv(history: list[dict], out_dir: Path) -> Path:
         "water_vol_error_rel",
         "water_vol_error_percent",
         "water_filled_mesh_volume_uL",
-        "p0_lg_heron_pa",
-        "p0_lg_vertex_count",
+        "p0_neck_fit_pa",
+        "p0_neck_fit_delta_p_pa",
+        "p0_neck_fit_H_1pm",
+        "diagnostic_lv_H_avg_1pm",
+        "diagnostic_lv_H_avg_vertex_count",
+        "p0_neck_fit_radius_mm",
+        "p0_neck_fit_rz",
+        "p0_neck_fit_rzz_1pm",
+        "p0_neck_fit_vertex_count",
+        "p0_neck_fit_half_window_rings",
+        "p0_neck_fit_degree",
+        "p0_neck_ring_index",
         "Ftopspherecap_p0_mN",
         "top_cl_avg_ux_mps",
         "top_cl_avg_uy_mps",
         "top_cl_avg_uz_mps",
+        "top_cl_avg_ucl_x_mps",
+        "top_cl_avg_ucl_y_mps",
+        "top_cl_avg_ucl_z_mps",
+        "top_cl_avg_dxyz_x_m",
+        "top_cl_avg_dxyz_y_m",
+        "top_cl_avg_dxyz_z_m",
+        "top_cl_radius_m",
+        "top_cl_radius_mm",
+        "top_cl_vertex_count",
+        "top_cl_avg_Fp_mN",
+        "top_cl_avg_Fs_mN",
+        "top_cl_avg_Fv_mN",
+        "top_cl_avg_Fcl_mN",
+        "top_cl_avg_Ftot_mN",
         "top_sphere_Fp_mN",
         "top_sphere_Fs_mN",
         "top_sphere_Fv_mN",
@@ -902,12 +926,36 @@ def _save_output_csv(history: list[dict], out_dir: Path) -> Path:
                     "water_vol_error_rel": float(row.get("water_vol_error_rel", 0.0)),
                     "water_vol_error_percent": float(row.get("water_vol_error_percent", 0.0)),
                     "water_filled_mesh_volume_uL": float(row.get("water_filled_mesh_volume_uL", 0.0)),
-                    "p0_lg_heron_pa": float(row.get("p0_lg_heron_pa", 0.0)),
-                    "p0_lg_vertex_count": int(row.get("p0_lg_vertex_count", 0)),
+                    "p0_neck_fit_pa": float(row.get("p0_neck_fit_pa", 0.0)),
+                    "p0_neck_fit_delta_p_pa": float(row.get("p0_neck_fit_delta_p_pa", 0.0)),
+                    "p0_neck_fit_H_1pm": float(row.get("p0_neck_fit_H_1pm", 0.0)),
+                    "diagnostic_lv_H_avg_1pm": float(row.get("diagnostic_lv_H_avg_1pm", 0.0)),
+                    "diagnostic_lv_H_avg_vertex_count": int(row.get("diagnostic_lv_H_avg_vertex_count", 0)),
+                    "p0_neck_fit_radius_mm": float(row.get("p0_neck_fit_radius_mm", 0.0)),
+                    "p0_neck_fit_rz": float(row.get("p0_neck_fit_rz", 0.0)),
+                    "p0_neck_fit_rzz_1pm": float(row.get("p0_neck_fit_rzz_1pm", 0.0)),
+                    "p0_neck_fit_vertex_count": int(row.get("p0_neck_fit_vertex_count", 0)),
+                    "p0_neck_fit_half_window_rings": int(row.get("p0_neck_fit_half_window_rings", 0)),
+                    "p0_neck_fit_degree": int(row.get("p0_neck_fit_degree", 0)),
+                    "p0_neck_ring_index": int(row.get("p0_neck_ring_index", -1)),
                     "Ftopspherecap_p0_mN": float(row.get("Ftopspherecap_p0_mN", 0.0)),
                     "top_cl_avg_ux_mps": float(row.get("top_cl_avg_ux_mps", 0.0)),
                     "top_cl_avg_uy_mps": float(row.get("top_cl_avg_uy_mps", 0.0)),
                     "top_cl_avg_uz_mps": float(row.get("top_cl_avg_uz_mps", 0.0)),
+                    "top_cl_avg_ucl_x_mps": float(row.get("top_cl_avg_ucl_x_mps", row.get("top_cl_avg_ux_mps", 0.0))),
+                    "top_cl_avg_ucl_y_mps": float(row.get("top_cl_avg_ucl_y_mps", row.get("top_cl_avg_uy_mps", 0.0))),
+                    "top_cl_avg_ucl_z_mps": float(row.get("top_cl_avg_ucl_z_mps", row.get("top_cl_avg_uz_mps", 0.0))),
+                    "top_cl_avg_dxyz_x_m": float(row.get("top_cl_avg_dxyz_x_m", 0.0)),
+                    "top_cl_avg_dxyz_y_m": float(row.get("top_cl_avg_dxyz_y_m", 0.0)),
+                    "top_cl_avg_dxyz_z_m": float(row.get("top_cl_avg_dxyz_z_m", 0.0)),
+                    "top_cl_radius_m": float(row.get("top_cl_radius_m", 0.0)),
+                    "top_cl_radius_mm": float(row.get("top_cl_radius_mm", 0.0)),
+                    "top_cl_vertex_count": int(row.get("top_cl_vertex_count", 0)),
+                    "top_cl_avg_Fp_mN": float(row.get("top_cl_avg_Fp_mN", 0.0)),
+                    "top_cl_avg_Fs_mN": float(row.get("top_cl_avg_Fs_mN", 0.0)),
+                    "top_cl_avg_Fv_mN": float(row.get("top_cl_avg_Fv_mN", 0.0)),
+                    "top_cl_avg_Fcl_mN": float(row.get("top_cl_avg_Fcl_mN", 0.0)),
+                    "top_cl_avg_Ftot_mN": float(row.get("top_cl_avg_Ftot_mN", 0.0)),
                     "top_sphere_Fp_mN": float(row.get("top_sphere_Fp_mN", 0.0)),
                     "top_sphere_Fs_mN": float(row.get("top_sphere_Fs_mN", 0.0)),
                     "top_sphere_Fv_mN": float(row.get("top_sphere_Fv_mN", 0.0)),
@@ -1369,7 +1417,7 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
         print(f"Gravity acceleration      = {config.gravity_mps2:.3f} m/s^2")
     print(f"Internal pressure offset  = {config.internal_pressure_pa:.3e} Pa")
     print(f"Continuity pressure seed  = {config.continuity_pressure_pa:.3e} Pa")
-    print("Static capillary pressure = off")
+    print("Static capillary pressure = neck meridian-fit Young-Laplace p0")
     print("Interface surface force   = Heron curvature operator")
     print("Contact-line force        = Cox-angle capillary line force")
     print(f"Contact angle assumption  = {config.contact_angle_deg:.1f} deg (literature-informed baseline)")
@@ -1378,8 +1426,8 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
     print("Fixed sphere              = top sphere (balance side)")
     print("Moving sphere             = bottom sphere (stage side)")
     print(f"Integration substeps      = {config.integration_substeps}")
-    print(f"Contact-radius samples    = {config.contact_radius_samples}")
-    print("Pressure force            = internal/continuity pressure in liquid stress")
+    print("Flow velocity             = sparse Stokes/continuity solve")
+    print("Pressure force            = static p0 + Stokes pressure in liquid stress")
     print("Fp,proj                   = removed")
     print(f"No-swirl enforcement      = {'on' if config.enforce_no_swirl else 'off'}")
     if config.dt > 0.0 and not config.enable_adaptive_dt:

@@ -3,7 +3,7 @@
 This module owns state/configuration, mesh input, physics forces, pressure,
 contact-line motion, volume handling, and time stepping.  Plotting, .msh/CSV/JSON
 output, Fig. 5 digitized experiment data, and CLI code live in
-``Case_2b_axisym_pitois2000_separation_Gmsh v2.py``.
+``Case_2b_axisym_pitois2000_separation_Gmsh v3.py``.
 """
 
 from __future__ import annotations
@@ -123,7 +123,6 @@ USER_MESH_SNAPSHOT_EVERY_STEPS = 10
 USER_INCLUDE_GRAVITY = True
 USER_GRAVITY_MPS2 = 9.81
 USER_INTEGRATION_SUBSTEPS = 1
-USER_CONTACT_RADIUS_SAMPLES = 128
 USER_GEOMETRIC_VOLUME_CORRECTION_MAX_ITERS = 12
 USER_GEOMETRIC_VOLUME_CORRECTION_REL_TOL = 1.0e-6
 USER_MAX_ACCELERATION = 5.0e-3
@@ -131,15 +130,16 @@ USER_ABORT_ON_NONFINITE_STATE = True
 USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION = False
 USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL = 5.0e-3
 USER_MAX_VOLUME_REL_ERROR_FOR_ABORT = 0.25
-USER_ALLOW_CONTACT_LINE_GROWTH = True
 USER_ENABLE_DYNAMIC_CONTACT_ANGLE = True
 USER_DYNAMIC_CONTACT_ANGLE_MAX_DEG = 25.0
 USER_DYNAMIC_CONTACT_ANGLE_MIN_DEG = 0.0
 USER_CONTACT_LINE_MAX_SLIDE_UM = 5.0
-USER_CONTACT_LINE_CONTINUATION_WEIGHT = 0.02
-USER_CONTACT_LINE_FIT_RINGS = 4
 USER_CONTACT_LINE_COX_MACRO_LENGTH_M = 1.0e-3
 USER_CONTACT_LINE_COX_SLIP_LENGTH_M = 2.0e-9
+# Static capillary pressure from a smooth meridian fit, not raw Heron
+# vertexwise pressure.  The default uses half of the refined neck band.
+USER_P0_MERIDIAN_FIT_HALF_WINDOW_RINGS = max(3, USER_NECK_EXTRA_AXIAL_LAYERS // 2)
+USER_P0_MERIDIAN_FIT_POLY_DEGREE = 2
 # The run loops honor this value now. Keep the default serial because this
 # operator is Python/object-graph heavy; 8 ThreadPool workers tested slower on
 # the current axisymmetric force-cache path. Raise manually after benchmarking.
@@ -220,17 +220,13 @@ class VolumetricPitoisConfig:
     pressure_scale: float = 1.0
     include_gravity: bool = USER_INCLUDE_GRAVITY
     gravity_mps2: float = USER_GRAVITY_MPS2
-    contact_radius_samples: int = USER_CONTACT_RADIUS_SAMPLES
     enable_gmsh_geometric_volume_correction: bool = USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION
     gmsh_geometric_volume_correction_trigger_rel: float = USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL
     max_volume_rel_error_for_abort: float = USER_MAX_VOLUME_REL_ERROR_FOR_ABORT
-    allow_contact_line_growth: bool = USER_ALLOW_CONTACT_LINE_GROWTH
     enable_dynamic_contact_angle: bool = USER_ENABLE_DYNAMIC_CONTACT_ANGLE
     dynamic_contact_angle_max_deg: float = USER_DYNAMIC_CONTACT_ANGLE_MAX_DEG
     dynamic_contact_angle_min_deg: float = USER_DYNAMIC_CONTACT_ANGLE_MIN_DEG
     contact_line_max_slide_um: float = USER_CONTACT_LINE_MAX_SLIDE_UM
-    contact_line_continuation_weight: float = USER_CONTACT_LINE_CONTINUATION_WEIGHT
-    contact_line_fit_rings: int = USER_CONTACT_LINE_FIT_RINGS
     contact_line_cox_macro_length_m: float = USER_CONTACT_LINE_COX_MACRO_LENGTH_M
     contact_line_cox_slip_length_m: float = USER_CONTACT_LINE_COX_SLIP_LENGTH_M
     accel_workers: int = USER_ACCEL_WORKERS
@@ -304,6 +300,8 @@ class VolumetricPitoisState:
     last_dt_limiter: str = "fixed"
     last_contact_line_volume_delta_m3: float = 0.0
     contact_line_slide_velocity_map: dict[int, float] = field(default_factory=dict)
+    last_top_cl_avg_ucl: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=float))
+    last_top_cl_avg_dxyz: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=float))
     surface_export_vertices: list = field(default_factory=list)
     surface_export_node_ids: dict[int, int] = field(default_factory=dict)
     surface_export_side_tris: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=int))
@@ -626,7 +624,7 @@ def _surface_triangles_xyz_from_indices(state: VolumetricPitoisState, tris: np.n
 
 def separation_config() -> VolumetricPitoisConfig:
     return VolumetricPitoisConfig(
-        name="Case_2b_axisym_pitois2000_separation_Gmsh",
+        name="Case_2b_axisym_pitois2000_separation_Gmsh v3",
         title="Case 2b axisym: volumetric pre-bridged separation",
     )
 
@@ -778,6 +776,44 @@ def _force_Fs_Heron(v, *, dim: int, state: VolumetricPitoisState) -> np.ndarray:
             if gamma != 0.0:
                 return surface_tension_force(v, gamma=gamma, dim=dim)
     return np.zeros(dim)
+
+
+def _lubrication_pressure_diagnostics(state: VolumetricPitoisState) -> SimpleNamespace:
+    cached = getattr(state, "_lubrication_pressure_cache", None)
+    if cached is not None:
+        return cached
+
+    radius = max(float(state.config.particle_radius), 1.0e-30)
+    gap = max(float(_gap(state)), 1.0e-12)
+    mu = max(float(state.config.mu_f), 0.0)
+    separation_speed = float(state.config.relative_speed)
+    volume = max(float(_snapshot_msh_volume_m3(state)), 0.0)
+    if mu <= 0.0 or abs(separation_speed) <= 1.0e-30 or volume <= 0.0:
+        cached = SimpleNamespace(
+            pressure_center_pa=0.0,
+            radius_m=0.0,
+            force_n=0.0,
+        )
+        state._lubrication_pressure_cache = cached
+        return cached
+
+    bridge_factor = 1.0 - (
+        1.0 + 2.0 * volume / (math.pi * radius * gap * gap)
+    ) ** -0.5
+    bridge_factor = float(np.clip(bridge_factor, 0.0, 1.0))
+    lubrication_radius_sq = max(radius * gap * bridge_factor, 0.0)
+    lubrication_radius = math.sqrt(lubrication_radius_sq)
+    pressure_coeff = -3.0 * mu * separation_speed / max(gap**3, 1.0e-30)
+    pressure_center = pressure_coeff * lubrication_radius_sq
+    force_n = 0.5 * math.pi * pressure_coeff * lubrication_radius_sq * lubrication_radius_sq
+
+    cached = SimpleNamespace(
+        pressure_center_pa=float(pressure_center),
+        radius_m=float(lubrication_radius),
+        force_n=float(force_n),
+    )
+    state._lubrication_pressure_cache = cached
+    return cached
 
 
 def _force_Fp_Fv_Fs_components(
@@ -1029,45 +1065,158 @@ def _side_area_normal_maps_cached(
     return cached
 
 
-def _liquid_gas_interior_vertices_for_static_p0(state: VolumetricPitoisState) -> list:
-    rings = [list(ring) for ring in getattr(state, "outer_rings", []) if ring]
-    if len(rings) <= 2:
-        return []
-
-    vertices: list = []
-    seen: set[int] = set()
-    for ring in rings[1:-1]:
-        for v in ring:
-            vid = id(v)
-            if vid in seen:
-                continue
-            seen.add(vid)
-            vertices.append(v)
-    return vertices
-
-
-def _static_p0_liquid_gas_heron_diagnostics(state: VolumetricPitoisState) -> SimpleNamespace:
-    cached = getattr(state, "_static_p0_liquid_gas_heron_cache", None)
+def _liquid_vapor_H_msh_diagnostics(state: VolumetricPitoisState) -> SimpleNamespace:
+    cached = getattr(state, "_liquid_vapor_H_msh_cache", None)
     if cached is not None:
         return cached
 
-    _side_vertices, side_area_map, side_normal_map = _side_area_normal_maps_cached(state)
-    p0_vertices = _liquid_gas_interior_vertices_for_static_p0(state)
-    numerator = 0.0
-    denominator = 0.0
-    for v in p0_vertices:
-        area = float(side_area_map.get(id(v), 0.0))
-        normal = side_normal_map.get(id(v))
-        if area <= 0.0 or normal is None:
-            continue
-        Fs = _force_Fs_Heron(v, dim=3, state=state)
-        numerator += float(np.dot(Fs, normal))
-        denominator += area
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    mid = 0.5 * (np.asarray(bottom_center, dtype=float) + np.asarray(top_center, dtype=float))
+    rings = [list(ring) for ring in _ordered_outer_rings_for_surface(state) if ring]
+    _side_vertices, side_area_map, _side_normal_map = _side_area_normal_maps_cached(state)
 
-    p0_pa = -numerator / denominator if denominator > 1.0e-30 else 0.0
+    axial = []
+    radii = []
+    areas = []
+    vertex_count = 0
+    for ring in rings:
+        coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in ring], dtype=float)
+        axial.append(float(np.mean(np.dot(coords - mid[None, :], axis))))
+        radii.append(float(_mean_ring_radius(ring, mid, axis)))
+        areas.append(float(sum(float(side_area_map.get(id(v), 0.0)) for v in ring)))
+        vertex_count += len(ring)
+
+    if len(radii) < 3:
+        cached = SimpleNamespace(H_avg_1pm=0.0, vertex_count=int(vertex_count), area_m2=0.0)
+        state._liquid_vapor_H_msh_cache = cached
+        return cached
+
+    axial_arr = np.asarray(axial, dtype=float)
+    radii_arr = np.asarray(radii, dtype=float)
+    area_arr = np.asarray(areas, dtype=float)
+    order = np.argsort(axial_arr)
+    axial_arr = axial_arr[order]
+    radii_arr = np.maximum(radii_arr[order], 1.0e-30)
+    area_arr = np.maximum(area_arr[order], 0.0)
+
+    rz = np.gradient(radii_arr, axial_arr, edge_order=2)
+    rzz = np.gradient(rz, axial_arr, edge_order=2)
+    slope_factor = 1.0 + rz * rz
+    H_ring = (
+        rzz / (slope_factor ** 1.5)
+        - 1.0 / (radii_arr * np.sqrt(slope_factor))
+    )
+
+    valid = np.isfinite(H_ring) & np.isfinite(area_arr) & (area_arr > 1.0e-30)
+    denominator = float(np.sum(area_arr[valid]))
+    if denominator > 1.0e-30:
+        H_avg_1pm = float(np.sum(H_ring[valid] * area_arr[valid]) / denominator)
+    else:
+        H_avg_1pm = 0.0
+    cached = SimpleNamespace(
+        H_avg_1pm=float(H_avg_1pm),
+        vertex_count=int(vertex_count),
+        area_m2=float(denominator),
+    )
+    state._liquid_vapor_H_msh_cache = cached
+    return cached
+
+
+def _static_p0_meridian_fit_diagnostics(state: VolumetricPitoisState) -> SimpleNamespace:
+    cached = getattr(state, "_static_p0_meridian_fit_cache", None)
+    if cached is not None:
+        return cached
+
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    mid = 0.5 * (np.asarray(bottom_center, dtype=float) + np.asarray(top_center, dtype=float))
+    rings = [list(ring) for ring in getattr(state, "outer_rings", []) if ring]
+    if not rings:
+        cached = SimpleNamespace(
+            p0_pa=0.0,
+            delta_p_pa=0.0,
+            H_1pm=0.0,
+            H_avg_1pm=0.0,
+            radius_m=0.0,
+            rz=0.0,
+            rzz_1pm=0.0,
+            top_cap_force_n=0.0,
+            vertex_count=0,
+            neck_ring_index=-1,
+            fit_half_window_rings=0,
+            fit_degree=0,
+        )
+        state._static_p0_meridian_fit_cache = cached
+        return cached
+
+    axial = []
+    radii = []
+    ring_counts = []
+    for ring in rings:
+        coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in ring], dtype=float)
+        axial.append(float(np.mean(np.dot(coords - mid[None, :], axis))))
+        radii.append(float(_mean_ring_radius(ring, mid, axis)))
+        ring_counts.append(len(ring))
+
+    axial_arr = np.asarray(axial, dtype=float)
+    radii_arr = np.asarray(radii, dtype=float)
+    order = np.argsort(axial_arr)
+    axial_arr = axial_arr[order]
+    radii_arr = radii_arr[order]
+    ring_count_arr = np.asarray(ring_counts, dtype=int)[order]
+    neck_ring_index = int(np.argmin(radii_arr))
+
+    half_window = min(
+        max(1, int(USER_P0_MERIDIAN_FIT_HALF_WINDOW_RINGS)),
+        neck_ring_index,
+        len(radii_arr) - 1 - neck_ring_index,
+    )
+    start = neck_ring_index - half_window
+    stop = neck_ring_index + half_window + 1
+    fit_count = int(stop - start)
+    fit_degree = min(max(2, int(USER_P0_MERIDIAN_FIT_POLY_DEGREE)), fit_count - 1)
+    if fit_count < 3 or fit_degree < 2:
+        H_1pm = 0.0
+        H_avg_1pm = 0.0
+        delta_p_pa = 0.0
+        p0_pa = 0.0
+        radius_m = float(radii_arr[neck_ring_index])
+        rz = 0.0
+        rzz_1pm = 0.0
+    else:
+        x = axial_arr[start:stop] - float(axial_arr[neck_ring_index])
+        y = radii_arr[start:stop]
+        coeff = np.polyfit(x, y, deg=fit_degree)
+        poly = np.poly1d(coeff)
+        dpoly = np.polyder(poly, 1)
+        ddpoly = np.polyder(poly, 2)
+        radius_m = max(float(poly(0.0)), 1.0e-30)
+        rz = float(dpoly(0.0))
+        rzz_1pm = float(ddpoly(0.0))
+        slope_factor = 1.0 + rz * rz
+        H_1pm = (
+            rzz_1pm / (slope_factor ** 1.5)
+            - 1.0 / (radius_m * math.sqrt(slope_factor))
+        )
+        fit_x = x
+        fit_radius = np.maximum(poly(fit_x), 1.0e-30)
+        fit_rz = dpoly(fit_x)
+        fit_rzz = ddpoly(fit_x)
+        fit_slope_factor = 1.0 + fit_rz * fit_rz
+        fit_H = (
+            fit_rzz / (fit_slope_factor ** 1.5)
+            - 1.0 / (fit_radius * np.sqrt(fit_slope_factor))
+        )
+        fit_weights = np.asarray(ring_count_arr[start:stop], dtype=float)
+        if fit_H.size and np.sum(fit_weights) > 0.0:
+            H_avg_1pm = float(np.average(fit_H, weights=fit_weights))
+        else:
+            H_avg_1pm = float(H_1pm)
+        delta_p_pa = float(state.config.gamma) * float(H_1pm)
+        # The meridian formula gives the air-to-liquid pressure drop.  The
+        # stress operator stores liquid pressure relative to gas, so use -dp.
+        p0_pa = -float(delta_p_pa)
 
     _boundary_vertices, cap_area_map, cap_normal_map = _boundary_area_normal_maps_cached(state)
-    _bottom_center, _top_center, axis = _particle_centers_physical(state)
     top_cap_force_n = 0.0
     for v in state.cap_top:
         area = float(cap_area_map.get(id(v), 0.0))
@@ -1078,10 +1227,19 @@ def _static_p0_liquid_gas_heron_diagnostics(state: VolumetricPitoisState) -> Sim
 
     cached = SimpleNamespace(
         p0_pa=float(p0_pa),
+        delta_p_pa=float(delta_p_pa),
+        H_1pm=float(H_1pm),
+        H_avg_1pm=float(H_avg_1pm),
+        radius_m=float(radius_m),
+        rz=float(rz),
+        rzz_1pm=float(rzz_1pm),
         top_cap_force_n=float(top_cap_force_n),
-        vertex_count=int(len(p0_vertices)),
+        vertex_count=int(np.sum(ring_count_arr[start:stop])) if fit_count > 0 else 0,
+        neck_ring_index=int(neck_ring_index),
+        fit_half_window_rings=int(half_window),
+        fit_degree=int(fit_degree),
     )
-    state._static_p0_liquid_gas_heron_cache = cached
+    state._static_p0_meridian_fit_cache = cached
     return cached
 
 
@@ -1146,46 +1304,82 @@ def _gmsh_viscous_force_map(state: VolumetricPitoisState) -> dict[int, np.ndarra
     return force_map
 
 
-def _update_continuity_pressure_scalar(state: VolumetricPitoisState, *, dt: float) -> None:
-    base_pressure = float(getattr(state.config, "continuity_pressure_pa", 0.0))
-    state.continuity_pressure_scalar = base_pressure
-    state.continuity_pressure_map = {}
-    _update_pressure_scalar(state)
-    if dt <= 0.0:
-        return
+def _stokes_boundary_velocity_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
+    bottom_velocity = np.array([0.0, 0.0, -float(state.config.cap_speed)], dtype=float)
+    top_velocity = np.zeros(3, dtype=float)
+    velocity_map: dict[int, np.ndarray] = {}
+    for v in state.cap_bottom_interior:
+        velocity_map[id(v)] = bottom_velocity
+    for v in state.cap_top_interior:
+        velocity_map[id(v)] = top_velocity
+    return velocity_map
+
+
+def _raw_stokes_force_load_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
+    vertices = list(getattr(state, "volume_export_vertices", [])) or list(state.HC.V)
+    load_map = {id(vertex): np.zeros(3, dtype=float) for vertex in vertices}
+    gravity = np.zeros(3, dtype=float)
+    if bool(getattr(state.config, "include_gravity", False)):
+        gravity = np.array([0.0, 0.0, -float(state.config.gravity_mps2)], dtype=float)
+
+    for vertex in vertices:
+        load = _force_Fs_Heron(vertex, dim=3, state=state) + _force_Fcl_Cox(vertex, state=state)
+        if float(np.linalg.norm(gravity)) > 0.0:
+            volume_i = max(float(getattr(vertex, "m", 0.0)), 0.0)
+            load = load + float(state.config.rho_f) * volume_i * gravity
+        load_map[id(vertex)] = np.asarray(load, dtype=float)
+    return load_map
+
+
+def _initialize_stokes_reference_force_load(state: VolumetricPitoisState) -> None:
+    state.stokes_reference_force_load_map = {
+        vertex_id: np.asarray(load, dtype=float).copy()
+        for vertex_id, load in _raw_stokes_force_load_map(state).items()
+    }
+
+
+def _stokes_force_load_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
+    """Incremental nodal loads that drive the Stokes velocity solve."""
+    raw_map = _raw_stokes_force_load_map(state)
+    reference_map = getattr(state, "stokes_reference_force_load_map", None)
+    if reference_map is None:
+        _initialize_stokes_reference_force_load(state)
+        reference_map = getattr(state, "stokes_reference_force_load_map", {})
+    return {
+        vertex_id: np.asarray(load, dtype=float)
+        - np.asarray(reference_map.get(vertex_id, np.zeros(3, dtype=float)), dtype=float)
+        for vertex_id, load in raw_map.items()
+    }
+
+
+def _solve_stokes_continuity_flow(state: VolumetricPitoisState, *, dt: float) -> bool:
+    del dt
+    if not bool(getattr(state, "gmsh_compute_mesh", False)):
+        return False
 
     vertices = list(getattr(state, "volume_export_vertices", [])) or list(state.HC.V)
     tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
     if not vertices or tets.size == 0:
-        return
+        return False
 
     try:
         from scipy.sparse import lil_matrix
         from scipy.sparse.linalg import lsmr
     except Exception:
-        return
+        return False
 
     n_vertices = len(vertices)
+    n_velocity = 3 * n_vertices
+    n_unknowns = n_velocity + n_vertices
     coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in vertices], dtype=float)
     id_to_idx = {id(vertex): idx for idx, vertex in enumerate(vertices)}
-    masses = np.asarray([max(float(getattr(v, "m", 0.0)), 1.0e-12) for v in vertices], dtype=float)
-    velocities = np.asarray([np.asarray(v.u[:3], dtype=float) for v in vertices], dtype=float)
+    mu = float(state.mps.get_mu(0) if state.mps is not None else state.config.mu_f)
+    if abs(mu) <= 1.0e-30:
+        return False
 
-    zero_pressure = lambda vv, HC=None, dim=3: 0.0
-    predictor_force = np.zeros((n_vertices, 3), dtype=float)
-    for vertex in vertices:
-        if vertex in state.bV_caps:
-            continue
-        predictor_force[id_to_idx[id(vertex)]] = _Ftot(
-            vertex,
-            state=state,
-            pressure_model=zero_pressure,
-            include_contact_line=True,
-        )
-    predictor_velocity = velocities + float(dt) * predictor_force / masses[:, None]
+    matrix = lil_matrix((n_unknowns, n_unknowns), dtype=float)
+    rhs = np.zeros(n_unknowns, dtype=float)
 
-    stiffness = lil_matrix((n_vertices, n_vertices), dtype=float)
-    rhs = np.zeros(n_vertices, dtype=float)
     for tet in tets:
         ids = [int(i) for i in tet]
         if any(i < 0 or i >= n_vertices for i in ids):
@@ -1201,36 +1395,81 @@ def _update_continuity_pressure_scalar(state: VolumetricPitoisState, *, dt: floa
         if volume <= 1.0e-30:
             continue
         grad_phi = inv_basis[1:, :].T
-        u_tet = np.mean(predictor_velocity[ids], axis=0)
-        for a in range(4):
-            ia = ids[a]
-            rhs[ia] += (volume / float(dt)) * float(np.dot(grad_phi[a], u_tet))
-            for b in range(4):
-                stiffness[ia, ids[b]] += volume * float(np.dot(grad_phi[a], grad_phi[b]))
 
-    matrix_csr = stiffness.tocsr()
+        for a, ia in enumerate(ids):
+            for b, ib in enumerate(ids):
+                dot_grad = float(np.dot(grad_phi[a], grad_phi[b]))
+                for i_dim in range(3):
+                    row = 3 * ia + i_dim
+                    for k_dim in range(3):
+                        col = 3 * ib + k_dim
+                        sym_grad = (
+                            (1.0 if i_dim == k_dim else 0.0) * dot_grad
+                            + float(grad_phi[b, i_dim] * grad_phi[a, k_dim])
+                        )
+                        matrix[row, col] += mu * volume * sym_grad
+
+                    p_col = n_velocity + ib
+                    matrix[row, p_col] += -(volume / 4.0) * float(grad_phi[a, i_dim])
+
+                    p_row = n_velocity + ia
+                    u_col = 3 * ib + i_dim
+                    matrix[p_row, u_col] += (volume / 4.0) * float(grad_phi[b, i_dim])
+
+    force_load_map = _stokes_force_load_map(state)
+    for vertex_id, force_load in force_load_map.items():
+        idx = id_to_idx.get(vertex_id)
+        if idx is None:
+            continue
+        for i_dim in range(3):
+            rhs[3 * idx + i_dim] -= float(force_load[i_dim])
+
+    boundary_velocity_map = _stokes_boundary_velocity_map(state)
+    for vertex_id, velocity in boundary_velocity_map.items():
+        idx = id_to_idx.get(vertex_id)
+        if idx is None:
+            continue
+        for i_dim in range(3):
+            row = 3 * idx + i_dim
+            matrix.rows[row] = [row]
+            matrix.data[row] = [1.0]
+            rhs[row] = float(velocity[i_dim])
+
+    # Pressure gauge: the Stokes pressure is determined up to a constant.
+    gauge_row = n_velocity
+    matrix.rows[gauge_row] = [gauge_row]
+    matrix.data[gauge_row] = [1.0]
+    rhs[gauge_row] = float(getattr(state.config, "continuity_pressure_pa", 0.0))
+
     try:
-        solved_pressure = np.asarray(
+        solution = np.asarray(
             lsmr(
-                matrix_csr,
+                matrix.tocsr(),
                 rhs,
-                atol=1.0e-12,
-                btol=1.0e-12,
-                maxiter=max(1000, 4 * n_vertices),
+                atol=1.0e-11,
+                btol=1.0e-11,
+                maxiter=max(2000, 8 * n_unknowns),
             )[0],
             dtype=float,
         )
     except Exception:
-        return
-    if solved_pressure.size < n_vertices or not np.all(np.isfinite(solved_pressure[:n_vertices])):
-        return
-    solved_pressure = solved_pressure[:n_vertices]
-    solved_pressure = solved_pressure - float(np.mean(solved_pressure))
+        return False
+    if solution.size < n_unknowns or not np.all(np.isfinite(solution[:n_unknowns])):
+        return False
 
-    solved_pressure = solved_pressure + base_pressure
-    state.continuity_pressure_map = {id(vertex): float(solved_pressure[idx]) for idx, vertex in enumerate(vertices)}
-    state.continuity_pressure_scalar = float(np.mean(solved_pressure)) if solved_pressure.size else base_pressure
+    solved_velocity = solution[:n_velocity].reshape((n_vertices, 3))
+    solved_pressure = solution[n_velocity:n_unknowns]
+    solved_pressure = solved_pressure + float(getattr(state.config, "continuity_pressure_pa", 0.0))
+
+    for vertex, velocity in zip(vertices, solved_velocity):
+        vertex.u[:3] = velocity
+    state.continuity_pressure_map = {
+        id(vertex): float(solved_pressure[idx]) for idx, vertex in enumerate(vertices)
+    }
+    state.continuity_pressure_scalar = float(np.mean(solved_pressure)) if solved_pressure.size else 0.0
     _update_pressure_scalar(state)
+    _axisym_clear_caches(state)
+    return True
 
 
 def _regularize_layer_order(state: VolumetricPitoisState) -> None:
@@ -1276,7 +1515,7 @@ def _pressure_model(v, *, HC=None, dim: int = 3, state: VolumetricPitoisState):
         )
     else:
         pressure = float(state.pressure_scalar)
-    pressure += float(_static_p0_liquid_gas_heron_diagnostics(state).p0_pa)
+    pressure += float(_static_p0_meridian_fit_diagnostics(state).p0_pa)
     if not state.config.include_gravity:
         return pressure
 
@@ -1392,107 +1631,6 @@ def _orthonormal_tangent_basis(axis: np.ndarray, reference: np.ndarray) -> tuple
     return e1, e2
 
 
-def _estimate_contact_radius(
-    state: VolumetricPitoisState,
-    *,
-    which: str,
-    sphere_center: np.ndarray,
-    contact_ring: list,
-    next_ring: list,
-    axis: np.ndarray,
-    dt: float | None,
-    gap_rate: float,
-) -> float:
-    prev_radius = _cap_radius(contact_ring)
-    if not next_ring:
-        return prev_radius
-
-    theta_target = np.deg2rad(float(state.config.contact_angle_deg))
-    radius = float(state.config.particle_radius)
-    inward_sign = 1.0 if which == "bottom" else -1.0
-    alpha_prev = float(np.arcsin(np.clip(prev_radius / max(radius, 1.0e-30), -1.0, 1.0)))
-    slide_limit = max(float(state.config.contact_line_max_slide_um) * 1.0e-6, 1.0e-9)
-    delta_alpha_max = slide_limit / max(radius, 1.0e-30)
-    alpha_min = max(1.0e-8, alpha_prev - delta_alpha_max)
-    alpha_max = min(0.5 * np.pi - 1.0e-8, alpha_prev + delta_alpha_max)
-    r_min = max(1.0e-8 * radius, radius * np.sin(alpha_min))
-    r_max = min(radius - 1.0e-6, radius * np.sin(alpha_max))
-    if r_max <= r_min:
-        return min(max(prev_radius, r_min), radius - 1.0e-6)
-
-    n_candidates = max(32, int(state.config.contact_radius_samples))
-    candidates = np.linspace(r_min, r_max, n_candidates, dtype=float)
-    local_rings = state.outer_rings[: max(2, int(state.config.contact_line_fit_rings) + 1)]
-    if which == "top":
-        local_rings = list(reversed(state.outer_rings[-max(2, int(state.config.contact_line_fit_rings) + 1) :]))
-    sample_pairs: list[tuple[float, float]] = []
-    for ring in local_rings[1:]:
-        coords = np.array([np.asarray(v.x_a[:3], dtype=float) for v in ring], dtype=float)
-        rel = coords - sphere_center[None, :]
-        s_k = float(np.mean(inward_sign * np.dot(rel, axis)))
-        tangential = rel - np.outer(np.dot(rel, axis), axis)
-        r_k = float(np.mean(np.linalg.norm(tangential, axis=1)))
-        sample_pairs.append((s_k, r_k))
-    if len(sample_pairs) < 2:
-        coords = np.array([np.asarray(v.x_a[:3], dtype=float) for v in next_ring], dtype=float)
-        rel = coords - sphere_center[None, :]
-        s_k = float(np.mean(inward_sign * np.dot(rel, axis)))
-        tangential = rel - np.outer(np.dot(rel, axis), axis)
-        r_k = float(np.mean(np.linalg.norm(tangential, axis=1)))
-        sample_pairs = [(s_k, r_k)]
-
-    s_contact = np.sqrt(np.maximum(radius**2 - candidates**2, 1.0e-16))
-    tangent_solid = np.stack([-s_contact, candidates], axis=1)
-    tangent_solid /= np.maximum(np.linalg.norm(tangent_solid, axis=1, keepdims=True), 1.0e-30)
-
-    angle = np.empty_like(candidates)
-    for idx, (r_contact, s_c) in enumerate(zip(candidates, s_contact)):
-        fit_pairs = [(s_c, r_contact)] + sample_pairs[: max(2, int(state.config.contact_line_fit_rings))]
-        s_vals = np.asarray([pair[0] for pair in fit_pairs], dtype=float)
-        r_vals = np.asarray([pair[1] for pair in fit_pairs], dtype=float)
-        x = s_vals - s_c
-        deg = 2 if x.size >= 3 else 1
-        coeff = np.polyfit(x, r_vals, deg=deg)
-        dr_ds = float(coeff[-2]) if deg >= 1 else 0.0
-        tangent_liquid = np.array([dr_ds, 1.0], dtype=float)
-        tangent_liquid /= max(float(np.linalg.norm(tangent_liquid)), 1.0e-30)
-        dot = float(np.clip(np.dot(tangent_solid[idx], tangent_liquid), -1.0, 1.0))
-        angle[idx] = float(np.arccos(dot))
-
-    theta_candidate = np.full_like(candidates, theta_target)
-    if bool(getattr(state.config, "enable_dynamic_contact_angle", False)) and dt is not None and dt > 0.0:
-        alpha_candidates = np.arcsin(np.clip(candidates / max(radius, 1.0e-30), -1.0, 1.0))
-        u_cl = radius * (alpha_candidates - alpha_prev) / dt
-        capillary_number = float(state.config.mu_f) * u_cl / max(float(state.config.gamma), 1.0e-30)
-        ln_fac = float(
-            np.log(
-                max(
-                    float(state.config.contact_line_cox_macro_length_m)
-                    / max(float(state.config.contact_line_cox_slip_length_m), 1.0e-30),
-                    1.0,
-                )
-            )
-        )
-        theta_candidate = np.cbrt(
-            np.maximum(theta_target**3 + 9.0 * capillary_number * ln_fac, np.deg2rad(float(state.config.dynamic_contact_angle_min_deg)) ** 3)
-        )
-        theta_candidate = np.clip(
-            theta_candidate,
-            np.deg2rad(float(state.config.dynamic_contact_angle_min_deg)),
-            np.deg2rad(float(state.config.dynamic_contact_angle_max_deg)),
-        )
-
-    angle_residual = np.abs(angle - theta_candidate)
-    continuation_penalty = float(state.config.contact_line_continuation_weight) * np.abs(
-        candidates - prev_radius
-    ) / max(radius, 1.0e-30)
-    growth_penalty = np.zeros_like(candidates)
-    if not bool(getattr(state.config, "allow_contact_line_growth", False)):
-        growth_penalty = 0.25 * np.maximum(candidates - prev_radius, 0.0) / max(radius, 1.0e-30)
-    best = int(np.argmin(angle_residual + continuation_penalty + growth_penalty))
-    return float(candidates[best])
-
-
 def _dynamic_contact_angle_from_speed(state: VolumetricPitoisState, *, slide_speed: float) -> float:
     theta_eq = float(np.deg2rad(state.config.contact_angle_deg))
     if not bool(getattr(state.config, "enable_dynamic_contact_angle", False)):
@@ -1522,6 +1660,77 @@ def _dynamic_contact_angle_from_speed(state: VolumetricPitoisState, *, slide_spe
             np.deg2rad(float(state.config.dynamic_contact_angle_max_deg)),
         )
     )
+
+
+def _cox_log_factor(state: VolumetricPitoisState) -> float:
+    return float(
+        np.log(
+            max(
+                float(state.config.contact_line_cox_macro_length_m)
+                / max(float(state.config.contact_line_cox_slip_length_m), 1.0e-30),
+                1.0,
+            )
+        )
+    )
+
+
+def _geometric_contact_angle(
+    state: VolumetricPitoisState,
+    *,
+    which: str,
+    sphere_center: np.ndarray,
+    contact_radius: float,
+    axis: np.ndarray,
+) -> float:
+    radius = float(state.config.particle_radius)
+    if contact_radius <= 0.0 or contact_radius >= radius:
+        return float(np.deg2rad(state.config.contact_angle_deg))
+
+    inward_sign = 1.0 if which == "bottom" else -1.0
+    fit_ring_count = 4
+    local_rings = state.outer_rings[: max(2, fit_ring_count + 1)]
+    if which == "top":
+        local_rings = list(reversed(state.outer_rings[-max(2, fit_ring_count + 1) :]))
+
+    sample_pairs: list[tuple[float, float]] = []
+    for ring in local_rings[1:]:
+        coords = np.array([np.asarray(v.x_a[:3], dtype=float) for v in ring], dtype=float)
+        rel = coords - np.asarray(sphere_center, dtype=float)[None, :]
+        s_k = float(np.mean(inward_sign * np.dot(rel, axis)))
+        tangential = rel - np.outer(np.dot(rel, axis), axis)
+        r_k = float(np.mean(np.linalg.norm(tangential, axis=1)))
+        sample_pairs.append((s_k, r_k))
+    if not sample_pairs:
+        return float(np.deg2rad(state.config.contact_angle_deg))
+
+    s_contact = float(np.sqrt(max(radius**2 - float(contact_radius) ** 2, 1.0e-16)))
+    fit_pairs = [(s_contact, float(contact_radius))] + sample_pairs[:fit_ring_count]
+    s_vals = np.asarray([pair[0] for pair in fit_pairs], dtype=float)
+    r_vals = np.asarray([pair[1] for pair in fit_pairs], dtype=float)
+    x = s_vals - s_contact
+    deg = 2 if x.size >= 3 else 1
+    try:
+        coeff = np.polyfit(x, r_vals, deg=deg)
+    except Exception:
+        return float(np.deg2rad(state.config.contact_angle_deg))
+    dr_ds = float(coeff[-2]) if deg >= 1 else 0.0
+
+    tangent_solid = np.array([-s_contact, float(contact_radius)], dtype=float)
+    tangent_solid /= max(float(np.linalg.norm(tangent_solid)), 1.0e-30)
+    tangent_liquid = np.array([dr_ds, 1.0], dtype=float)
+    tangent_liquid /= max(float(np.linalg.norm(tangent_liquid)), 1.0e-30)
+    dot = float(np.clip(np.dot(tangent_solid, tangent_liquid), -1.0, 1.0))
+    return float(np.arccos(dot))
+
+
+def _cox_inverse_contact_line_speed(state: VolumetricPitoisState, *, theta_geo: float) -> float:
+    if not bool(getattr(state.config, "enable_dynamic_contact_angle", False)):
+        return 0.0
+    theta_eq = float(np.deg2rad(state.config.contact_angle_deg))
+    ln_fac = max(_cox_log_factor(state), 1.0e-30)
+    mu = max(float(state.config.mu_f), 1.0e-30)
+    gamma = float(state.config.gamma)
+    return float(gamma * (float(theta_geo) ** 3 - theta_eq**3) / (9.0 * mu * ln_fac))
 
 
 def _contact_line_slide_direction(
@@ -1594,7 +1803,7 @@ def _force_Fcl_Cox(v, *, state: VolumetricPitoisState) -> np.ndarray:
         line_length = float(_ring_segment_length_map(ring).get(id(v), 0.0))
         if line_length <= 0.0:
             return np.zeros(3, dtype=float)
-        line_direction = axis if which == "top" else -axis
+        line_direction = -axis if which == "top" else axis
         return float(state.config.gamma) * line_length * float(np.cos(theta_dyn)) * line_direction
     return np.zeros(3, dtype=float)
 
@@ -2039,6 +2248,7 @@ def _prepare_gmsh_state(config: VolumetricPitoisConfig) -> VolumetricPitoisState
     _set_cap_velocities(state)
     _update_duals_and_masses(state)
     _update_pressure_scalar(state)
+    _initialize_stokes_reference_force_load(state)
     return state
 
 
@@ -2368,7 +2578,9 @@ def _axisym_clear_caches(state: VolumetricPitoisState) -> None:
         "_gmsh_axisym_force_terms_cache",
         "_gmsh_surface_heron_force_cache",
         "_gmsh_viscous_force_cache",
-        "_static_p0_liquid_gas_heron_cache",
+        "_lubrication_pressure_cache",
+        "_liquid_vapor_H_msh_cache",
+        "_static_p0_meridian_fit_cache",
         "_boundary_area_normal_cache",
         "_side_area_normal_cache",
     ):
@@ -2898,6 +3110,49 @@ def _project_gmsh_contact_lines_to_spheres(state: VolumetricPitoisState) -> None
             v.u = sphere_velocity + rel_u - float(np.dot(rel_u, normal)) * normal
 
 
+def _contact_line_slide_velocity_map_from_current_motion(
+    state: VolumetricPitoisState,
+    *,
+    axis: np.ndarray,
+) -> tuple[dict[int, float], float, float]:
+    bottom_velocity = np.array([0.0, 0.0, -float(state.config.cap_speed)], dtype=float)
+    top_velocity = np.zeros(3, dtype=float)
+    specs = (
+        (
+            state.bottom_contact_ring,
+            np.asarray(state.bottom_sphere_center, dtype=float),
+            bottom_velocity,
+            "bottom",
+        ),
+        (
+            state.top_contact_ring,
+            np.asarray(state.top_sphere_center, dtype=float),
+            top_velocity,
+            "top",
+        ),
+    )
+    slide_map: dict[int, float] = {}
+    ring_means: dict[str, float] = {"bottom": 0.0, "top": 0.0}
+    for ring, sphere_center, sphere_velocity, which in specs:
+        signed_speeds: list[float] = []
+        for v in ring:
+            slide_dir = _contact_line_slide_direction(
+                np.asarray(v.x_a[:3], dtype=float),
+                sphere_center=sphere_center,
+                axis=axis,
+                which=which,
+            )
+            if float(np.linalg.norm(slide_dir)) <= 1.0e-30:
+                speed = 0.0
+            else:
+                speed = float(np.dot(np.asarray(v.u[:3], dtype=float) - sphere_velocity, slide_dir))
+            slide_map[id(v)] = speed
+            signed_speeds.append(speed)
+        if signed_speeds:
+            ring_means[which] = float(np.mean(signed_speeds))
+    return slide_map, ring_means["bottom"], ring_means["top"]
+
+
 def _move_caps(state: VolumetricPitoisState, *, dt: float | None = None) -> None:
     if bool(getattr(state, "gmsh_compute_mesh", False)):
         if dt is None:
@@ -2947,29 +3202,49 @@ def _update_moving_contact_line(state: VolumetricPitoisState, *, dt: float | Non
             if state.top_contact_ring
             else 0.0
         )
+        old_bottom_contact_positions = {
+            id(v): np.asarray(v.x_a[:3], dtype=float).copy()
+            for v in state.bottom_contact_ring
+        }
+        old_top_contact_positions = {
+            id(v): np.asarray(v.x_a[:3], dtype=float).copy()
+            for v in state.top_contact_ring
+        }
 
-        bottom_next_ring = state.outer_rings[1] if len(state.outer_rings) > 1 else []
-        top_next_ring = state.outer_rings[-2] if len(state.outer_rings) > 1 else []
-        bottom_radius = _estimate_contact_radius(
+        bottom_theta_geo = _geometric_contact_angle(
             state,
             which="bottom",
             sphere_center=np.asarray(state.bottom_sphere_center, dtype=float),
-            contact_ring=state.bottom_contact_ring,
-            next_ring=bottom_next_ring,
+            contact_radius=prev_bottom_radius,
             axis=axis,
-            dt=dt,
-            gap_rate=float(state.config.relative_speed),
         )
-        top_radius = _estimate_contact_radius(
+        top_theta_geo = _geometric_contact_angle(
             state,
             which="top",
             sphere_center=np.asarray(state.top_sphere_center, dtype=float),
-            contact_ring=state.top_contact_ring,
-            next_ring=top_next_ring,
+            contact_radius=prev_top_radius,
             axis=axis,
-            dt=dt,
-            gap_rate=float(state.config.relative_speed),
         )
+        bottom_slide_velocity = _cox_inverse_contact_line_speed(state, theta_geo=bottom_theta_geo)
+        top_slide_velocity = _cox_inverse_contact_line_speed(state, theta_geo=top_theta_geo)
+        sphere_radius = max(float(state.config.particle_radius), 1.0e-30)
+        bottom_radius = float(
+            np.clip(
+                prev_bottom_radius - float(bottom_slide_velocity) * float(dt),
+                1.0e-8 * sphere_radius,
+                sphere_radius - 1.0e-6,
+            )
+        )
+        top_radius = float(
+            np.clip(
+                prev_top_radius - float(top_slide_velocity) * float(dt),
+                1.0e-8 * sphere_radius,
+                sphere_radius - 1.0e-6,
+            )
+        )
+        if float(dt) > 0.0:
+            bottom_slide_velocity = (bottom_radius - prev_bottom_radius) / float(dt)
+            top_slide_velocity = (top_radius - prev_top_radius) / float(dt)
         _rebuild_cap_on_sphere(
             state,
             which="bottom",
@@ -2988,26 +3263,51 @@ def _update_moving_contact_line(state: VolumetricPitoisState, *, dt: float | Non
         )
         _align_layer_azimuths(state)
         _regularize_layer_order(state)
-        after_volume = float(_snapshot_msh_volume_m3(state))
-        sphere_radius = max(float(state.config.particle_radius), 1.0e-30)
-        bottom_slide_velocity = 0.0
-        top_slide_velocity = 0.0
-        if float(dt) > 0.0:
-            alpha_bottom_prev = float(np.arcsin(np.clip(prev_bottom_radius / sphere_radius, -1.0, 1.0)))
-            alpha_bottom_new = float(np.arcsin(np.clip(bottom_radius / sphere_radius, -1.0, 1.0)))
-            alpha_top_prev = float(np.arcsin(np.clip(prev_top_radius / sphere_radius, -1.0, 1.0)))
-            alpha_top_new = float(np.arcsin(np.clip(top_radius / sphere_radius, -1.0, 1.0)))
-            bottom_slide_velocity = sphere_radius * (alpha_bottom_new - alpha_bottom_prev) / float(dt)
-            top_slide_velocity = sphere_radius * (alpha_top_new - alpha_top_prev) / float(dt)
-            state.last_bottom_contact_line_speed = abs(bottom_slide_velocity)
-            state.last_top_contact_line_speed = abs(top_slide_velocity)
+        bottom_sphere_velocity = np.array([0.0, 0.0, -float(state.config.cap_speed)], dtype=float)
+        top_sphere_velocity = np.zeros(3, dtype=float)
+        slide_map: dict[int, float] = {}
+        top_cl_displacements: list[np.ndarray] = []
+        for v in state.bottom_contact_ring:
+            old_pos = old_bottom_contact_positions.get(id(v), np.asarray(v.x_a[:3], dtype=float))
+            actual_velocity = (np.asarray(v.x_a[:3], dtype=float) - old_pos) / max(float(dt), 1.0e-30)
+            slide_dir = _contact_line_slide_direction(
+                np.asarray(v.x_a[:3], dtype=float),
+                sphere_center=np.asarray(state.bottom_sphere_center, dtype=float),
+                axis=axis,
+                which="bottom",
+            )
+            v.u = actual_velocity
+            slide_map[id(v)] = float(np.dot(actual_velocity - bottom_sphere_velocity, slide_dir))
+        for v in state.top_contact_ring:
+            old_pos = old_top_contact_positions.get(id(v), np.asarray(v.x_a[:3], dtype=float))
+            displacement = np.asarray(v.x_a[:3], dtype=float) - old_pos
+            actual_velocity = displacement / max(float(dt), 1.0e-30)
+            slide_dir = _contact_line_slide_direction(
+                np.asarray(v.x_a[:3], dtype=float),
+                sphere_center=np.asarray(state.top_sphere_center, dtype=float),
+                axis=axis,
+                which="top",
+            )
+            v.u = actual_velocity
+            slide_map[id(v)] = float(np.dot(actual_velocity - top_sphere_velocity, slide_dir))
+            top_cl_displacements.append(displacement)
+        if top_cl_displacements:
+            top_avg_dxyz = np.mean(np.asarray(top_cl_displacements, dtype=float), axis=0)
+            state.last_top_cl_avg_dxyz = np.asarray(top_avg_dxyz, dtype=float)
+            state.last_top_cl_avg_ucl = np.asarray(top_avg_dxyz, dtype=float) / max(float(dt), 1.0e-30)
         else:
-            state.last_bottom_contact_line_speed = 0.0
-            state.last_top_contact_line_speed = 0.0
-        state.contact_line_slide_velocity_map = {
-            **{id(v): float(bottom_slide_velocity) for v in state.bottom_contact_ring},
-            **{id(v): float(top_slide_velocity) for v in state.top_contact_ring},
-        }
+            state.last_top_cl_avg_dxyz = np.zeros(3, dtype=float)
+            state.last_top_cl_avg_ucl = np.zeros(3, dtype=float)
+        after_volume = float(_snapshot_msh_volume_m3(state))
+        state.last_bottom_contact_line_speed = max(
+            (abs(float(slide_map.get(id(v), 0.0))) for v in state.bottom_contact_ring),
+            default=0.0,
+        )
+        state.last_top_contact_line_speed = max(
+            (abs(float(slide_map.get(id(v), 0.0))) for v in state.top_contact_ring),
+            default=0.0,
+        )
+        state.contact_line_slide_velocity_map = slide_map
         state.last_contact_line_volume_delta_m3 = after_volume - before_volume
         _axisym_clear_caches(state)
         return
@@ -3430,12 +3730,18 @@ def _solver_top_sphere_force_components_n(state: VolumetricPitoisState) -> Simpl
         Fs = force_terms.Fs
         Fv = force_terms.Fv
         Fcl = force_terms.Fcl
-        Ftot = Fp + Fs + Fv + Fcl
         top_sphere_Fp_n += float(np.dot(Fp, axis))
         top_sphere_Fs_n += float(np.dot(Fs, axis))
         top_sphere_Fv_n += float(np.dot(Fv, axis))
         top_sphere_Fcl_n += float(np.dot(Fcl, axis))
-    top_sphere_Ftot_n = top_sphere_Fp_n + top_sphere_Fs_n + top_sphere_Fv_n + top_sphere_Fcl_n
+    # The local Gmsh viscous map is shear only; add the speed-dependent
+    # lubrication-pressure part of the Stokes stress to the sphere force.
+    top_sphere_Fv_n += float(_lubrication_pressure_diagnostics(state).force_n)
+    # Dynamic top-sphere comparison force:
+    #     F_top = integral_SL (-p I + tau) n dA + F_CL
+    # Fs is still written as a component column, but is not counted here because
+    # it acts on the liquid-vapor interface, not directly on the solid cap.
+    top_sphere_Ftot_n = top_sphere_Fp_n + top_sphere_Fv_n + top_sphere_Fcl_n
     return SimpleNamespace(
         Fp=float(top_sphere_Fp_n),
         Fs=float(top_sphere_Fs_n),
@@ -3470,6 +3776,52 @@ def _max_free_speed(state: VolumetricPitoisState) -> float:
             if v not in state.bV_caps
         ),
         default=0.0,
+    )
+
+
+def _top_contact_line_diagnostics(state: VolumetricPitoisState) -> SimpleNamespace:
+    _bottom_center, top_center, axis = _particle_centers_physical(state)
+    ring = list(getattr(state, "top_contact_ring", []))
+    if not ring:
+        return SimpleNamespace(
+            radius_m=0.0,
+            vertex_count=0,
+            avg_Fp_n=0.0,
+            avg_Fs_n=0.0,
+            avg_Fv_n=0.0,
+            avg_Fcl_n=0.0,
+            avg_Ftot_n=0.0,
+        )
+
+    radius_m = _mean_ring_radius(ring, np.asarray(top_center, dtype=float), axis)
+    sum_Fp_n = 0.0
+    sum_Fs_n = 0.0
+    sum_Fv_n = 0.0
+    sum_Fcl_n = 0.0
+    for v in ring:
+        force_terms = _Ftot_terms(v, state=state)
+        Fp = force_terms.Fp
+        Fs = force_terms.Fs
+        Fv = force_terms.Fv
+        Fcl = force_terms.Fcl
+        sum_Fp_n += float(np.dot(Fp, axis))
+        sum_Fs_n += float(np.dot(Fs, axis))
+        sum_Fv_n += float(np.dot(Fv, axis))
+        sum_Fcl_n += float(np.dot(Fcl, axis))
+
+    count = max(len(ring), 1)
+    avg_Fp_n = sum_Fp_n / count
+    avg_Fs_n = sum_Fs_n / count
+    avg_Fv_n = sum_Fv_n / count
+    avg_Fcl_n = sum_Fcl_n / count
+    return SimpleNamespace(
+        radius_m=float(radius_m),
+        vertex_count=int(len(ring)),
+        avg_Fp_n=float(avg_Fp_n),
+        avg_Fs_n=float(avg_Fs_n),
+        avg_Fv_n=float(avg_Fv_n),
+        avg_Fcl_n=float(avg_Fcl_n),
+        avg_Ftot_n=float(avg_Fp_n + avg_Fs_n + avg_Fv_n + avg_Fcl_n),
     )
 
 
@@ -3573,20 +3925,23 @@ def _step_record(state: VolumetricPitoisState, *, step: int, t: float) -> dict[s
     top_sphere_Fv_n = float(getattr(state, "top_sphere_Fv_n", 0.0))
     top_sphere_Fcl_n = float(getattr(state, "top_sphere_Fcl_n", 0.0))
     top_sphere_Ftot_n = float(getattr(state, "top_sphere_Ftot_n", top_sphere_force_n))
-    if state.top_contact_ring:
-        top_cl_avg_u = np.mean(
-            [np.asarray(v.u[:3], dtype=float) for v in state.top_contact_ring],
-            axis=0,
-        )
-    else:
-        top_cl_avg_u = np.zeros(3, dtype=float)
+    top_cl_avg_u = np.asarray(
+        getattr(state, "last_top_cl_avg_ucl", np.zeros(3, dtype=float)),
+        dtype=float,
+    )
+    top_cl_avg_dxyz = np.asarray(
+        getattr(state, "last_top_cl_avg_dxyz", np.zeros(3, dtype=float)),
+        dtype=float,
+    )
     gap = _gap(state)
     snapshot_msh_volume_m3 = _snapshot_msh_volume_m3(state)
     target_snapshot_volume_m3 = float(getattr(state, "target_snapshot_volume_m3", snapshot_msh_volume_m3))
     water_vol_error_rel = (snapshot_msh_volume_m3 - target_snapshot_volume_m3) / max(
         target_snapshot_volume_m3, 1.0e-30
     )
-    p0_diagnostics = _static_p0_liquid_gas_heron_diagnostics(state)
+    p0_diagnostics = _static_p0_meridian_fit_diagnostics(state)
+    lv_H_diagnostics = _liquid_vapor_H_msh_diagnostics(state)
+    top_cl_diagnostics = _top_contact_line_diagnostics(state)
     return {
         "step": int(step),
         "t": float(t),
@@ -3595,8 +3950,18 @@ def _step_record(state: VolumetricPitoisState, *, step: int, t: float) -> dict[s
         "water_vol_error_rel": float(water_vol_error_rel),
         "water_vol_error_percent": float(100.0 * water_vol_error_rel),
         "water_filled_mesh_volume_uL": float(1.0e9 * snapshot_msh_volume_m3),
-        "p0_lg_heron_pa": float(p0_diagnostics.p0_pa),
-        "p0_lg_vertex_count": int(p0_diagnostics.vertex_count),
+        "p0_neck_fit_pa": float(p0_diagnostics.p0_pa),
+        "p0_neck_fit_delta_p_pa": float(p0_diagnostics.delta_p_pa),
+        "p0_neck_fit_H_1pm": float(p0_diagnostics.H_1pm),
+        "diagnostic_lv_H_avg_1pm": float(lv_H_diagnostics.H_avg_1pm),
+        "diagnostic_lv_H_avg_vertex_count": int(lv_H_diagnostics.vertex_count),
+        "p0_neck_fit_radius_mm": 1.0e3 * float(p0_diagnostics.radius_m),
+        "p0_neck_fit_rz": float(p0_diagnostics.rz),
+        "p0_neck_fit_rzz_1pm": float(p0_diagnostics.rzz_1pm),
+        "p0_neck_fit_vertex_count": int(p0_diagnostics.vertex_count),
+        "p0_neck_fit_half_window_rings": int(p0_diagnostics.fit_half_window_rings),
+        "p0_neck_fit_degree": int(p0_diagnostics.fit_degree),
+        "p0_neck_ring_index": int(p0_diagnostics.neck_ring_index),
         "Ftopspherecap_p0_n": float(p0_diagnostics.top_cap_force_n),
         "Ftopspherecap_p0_mN": 1.0e3 * float(p0_diagnostics.top_cap_force_n),
         "top_sphere_Fp_n": top_sphere_Fp_n,
@@ -3612,6 +3977,20 @@ def _step_record(state: VolumetricPitoisState, *, step: int, t: float) -> dict[s
         "top_cl_avg_ux_mps": float(top_cl_avg_u[0]),
         "top_cl_avg_uy_mps": float(top_cl_avg_u[1]),
         "top_cl_avg_uz_mps": float(top_cl_avg_u[2]),
+        "top_cl_avg_ucl_x_mps": float(top_cl_avg_u[0]),
+        "top_cl_avg_ucl_y_mps": float(top_cl_avg_u[1]),
+        "top_cl_avg_ucl_z_mps": float(top_cl_avg_u[2]),
+        "top_cl_avg_dxyz_x_m": float(top_cl_avg_dxyz[0]),
+        "top_cl_avg_dxyz_y_m": float(top_cl_avg_dxyz[1]),
+        "top_cl_avg_dxyz_z_m": float(top_cl_avg_dxyz[2]),
+        "top_cl_radius_m": float(top_cl_diagnostics.radius_m),
+        "top_cl_radius_mm": 1.0e3 * float(top_cl_diagnostics.radius_m),
+        "top_cl_vertex_count": int(top_cl_diagnostics.vertex_count),
+        "top_cl_avg_Fp_mN": 1.0e3 * float(top_cl_diagnostics.avg_Fp_n),
+        "top_cl_avg_Fs_mN": 1.0e3 * float(top_cl_diagnostics.avg_Fs_n),
+        "top_cl_avg_Fv_mN": 1.0e3 * float(top_cl_diagnostics.avg_Fv_n),
+        "top_cl_avg_Fcl_mN": 1.0e3 * float(top_cl_diagnostics.avg_Fcl_n),
+        "top_cl_avg_Ftot_mN": 1.0e3 * float(top_cl_diagnostics.avg_Ftot_n),
         "top_sphere_force_n": float(top_sphere_force_n),
         "bottom_sphere_force_n": float(bottom_sphere_force_n),
         "fixed_force_axial": float(top_sphere_force_n),
@@ -3690,27 +4069,23 @@ def _snapshot_msh_volume_m3(
 
 
 
-def _advance_free_vertices_from_Ftot(state: VolumetricPitoisState, *, dt: float) -> None:
+def _advance_free_vertices_from_stokes_flow(state: VolumetricPitoisState, *, dt: float) -> None:
+    solved = _solve_stokes_continuity_flow(state, dt=dt)
+    if not solved:
+        raise RuntimeError("Stokes/continuity flow solve failed; refusing to fall back to Ftot/m motion.")
+    _gmsh_axisymmetrize_state(state)
+    _enforce_no_swirl_velocity_field(state)
     free_vertices = [v for v in state.HC.V if v not in state.bV_caps]
     updates = {}
     for v in free_vertices:
-        force_terms = _Ftot_terms(v, state=state)
-        Fp = force_terms.Fp
-        Fs = force_terms.Fs
-        Fv = force_terms.Fv
-        Fcl = force_terms.Fcl
-        Ftot = Fp + Fs + Fv + Fcl
-        mass = max(float(getattr(v, "m", 0.0)), 1.0e-12)
-        a = _clip_acceleration(np.asarray(Ftot, dtype=float) / mass, state)
         u_old = np.asarray(v.u[:3], dtype=float)
         x_old = np.asarray(v.x_a[:3], dtype=float)
 
         # Motion update:
-        #     a    = Ftot / m
-        #     u    = u + a * dt
-        #     dxyz = u * dt
+        #     u    = u_Stokes from the sparse Stokes/continuity solve
+        #     dxyz = u_Stokes * dt
         #     x    = x + dxyz
-        u_new = u_old + a * float(dt)
+        u_new = u_old
         dxyz = u_new * float(dt)
         x_new = x_old + dxyz
         updates[v] = (x_new, u_new)
@@ -3718,6 +4093,7 @@ def _advance_free_vertices_from_Ftot(state: VolumetricPitoisState, *, dt: float)
     for v, (x_new, u_new) in updates.items():
         v.u[:3] = u_new
         _move(v, x_new, state.HC, state.bV_caps)
+    _axisym_clear_caches(state)
 
 
 def advance_one_step(state: VolumetricPitoisState, *, step_index: int | None = None) -> float:
@@ -3731,9 +4107,7 @@ def advance_one_step(state: VolumetricPitoisState, *, step_index: int | None = N
         _gmsh_axisymmetrize_state(state)
         _update_duals_and_masses(state)
         _update_pressure_scalar(state)
-        _update_continuity_pressure_scalar(state, dt=sub_dt)
-        _update_top_sphere_force_n(state)
-        _advance_free_vertices_from_Ftot(state, dt=sub_dt)
+        _advance_free_vertices_from_stokes_flow(state, dt=sub_dt)
         _gmsh_axisymmetrize_state(state)
         _enforce_no_swirl_velocity_field(state)
         _set_cap_velocities(state)
@@ -3746,7 +4120,10 @@ def advance_one_step(state: VolumetricPitoisState, *, step_index: int | None = N
         _assert_fixed_topology(state)
         _update_duals_and_masses(state)
         _update_pressure_scalar(state)
-        _update_continuity_pressure_scalar(state, dt=sub_dt)
+        if not _solve_stokes_continuity_flow(state, dt=sub_dt):
+            raise RuntimeError("Stokes/continuity flow solve failed after geometry update.")
+        _gmsh_axisymmetrize_state(state)
+        _enforce_no_swirl_velocity_field(state)
         _update_top_sphere_force_n(state)
         _assert_fixed_topology(state)
     label = step_index + 1 if step_index is not None else "advance"

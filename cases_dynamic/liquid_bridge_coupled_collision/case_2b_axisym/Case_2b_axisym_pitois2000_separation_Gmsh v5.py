@@ -2,7 +2,7 @@
 
 This file owns plotting, .msh/CSV/JSON output, Fig. 5 digitized experiment
 data, CLI printing, and interactive viewing.  Computation is imported from
-``solver_v2.py``.
+``solver_v5.py``.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from matplotlib.ticker import FuncFormatter, NullFormatter
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 import numpy as np
 
-from solver_v2 import *
+from solver_v5 import *
 
 OUT_ROOT = Path(__file__).resolve().parent / Path(__file__).stem
 
@@ -59,6 +59,15 @@ USER_OPEN_INTERACTIVE_WINDOW = True
 USER_INTERACTIVE_STEP = USER_TOTAL_STEPS
 USER_INTERACTIVE_ELEV_DEG = 25.0
 USER_INTERACTIVE_AZIM_DEG = 45.0
+
+# Digitized first-point Fig. 5 increment:
+#   dF = F_black - F_white.
+# The black value is the first digitized dynamic point below; the white value is
+# read from the first open-circle static point in the same local Fig. 5 image.
+PITOIS_FIG5_FIRST_BLACK_MN = 1.515311539463195
+PITOIS_FIG5_FIRST_WHITE_MN = 0.38
+PITOIS_FIG5_FIRST_DF_BLACKWHITE_MN = PITOIS_FIG5_FIRST_BLACK_MN - PITOIS_FIG5_FIRST_WHITE_MN
+PITOIS_FIG5_FIRST_DF_BLACKWHITE_SIGNED_MN = -PITOIS_FIG5_FIRST_DF_BLACKWHITE_MN
 
 def _surface_side_triangles(state: VolumetricPitoisState) -> np.ndarray:
     if USER_SHOW_REAL_COMPUTE_TRIANGLES:
@@ -874,16 +883,59 @@ def _save_output_csv(history: list[dict], out_dir: Path) -> Path:
         "water_vol_error_rel",
         "water_vol_error_percent",
         "water_filled_mesh_volume_uL",
-        "p0_lg_heron_pa",
-        "p0_lg_vertex_count",
+        "p0_neck_fit_pa",
+        "p0_neck_fit_delta_p_pa",
+        "p0_neck_fit_H_1pm",
+        "diagnostic_lv_H_avg_1pm",
+        "diagnostic_lv_H_avg_vertex_count",
+        "p0_neck_fit_radius_mm",
+        "p0_neck_fit_rz",
+        "p0_neck_fit_rzz_1pm",
+        "p0_neck_fit_vertex_count",
+        "p0_neck_fit_half_window_rings",
+        "p0_neck_fit_degree",
+        "p0_neck_ring_index",
         "Ftopspherecap_p0_mN",
         "top_cl_avg_ux_mps",
         "top_cl_avg_uy_mps",
         "top_cl_avg_uz_mps",
+        "top_cl_avg_ucl_x_mps",
+        "top_cl_avg_ucl_y_mps",
+        "top_cl_avg_ucl_z_mps",
+        "top_cl_avg_dxyz_x_m",
+        "top_cl_avg_dxyz_y_m",
+        "top_cl_avg_dxyz_z_m",
+        "top_cl_radius_m",
+        "top_cl_radius_mm",
+        "top_cl_vertex_count",
+        "top_cl_avg_Fp0_mN",
+        "top_cl_avg_Fp_flow_mN",
+        "top_cl_avg_Ftau_mN",
+        "top_cl_avg_Fhydro_mN",
+        "top_cl_avg_Fp_mN",
+        "top_cl_avg_Fs_mN",
+        "top_cl_avg_Fv_mN",
+        "top_cl_avg_Fcl_mN",
+        "top_cl_avg_Fcl_static_mN",
+        "top_cl_avg_Fcl_dynamic_minus_static_mN",
+        "top_cl_avg_Finterface_total_mN",
+        "top_cl_avg_Ftot_mN",
+        "top_sphere_Fp0_mN",
+        "top_sphere_Fp_flow_mN",
+        "top_sphere_Fp_flow_stokes_mN",
+        "top_sphere_Fp_flow_lub_mN",
+        "top_sphere_Fp_flow_raw_plus_lub_mN",
+        "top_sphere_Ftau_mN",
+        "top_sphere_Fhydro_mN",
         "top_sphere_Fp_mN",
         "top_sphere_Fs_mN",
         "top_sphere_Fv_mN",
         "top_sphere_Fcl_mN",
+        "top_sphere_Fcl_static_mN",
+        "top_sphere_Fcl_dynamic_minus_static_mN",
+        "top_sphere_dF_blackwhite_mN",
+        "experiment_first_dF_blackwhite_mN",
+        "top_sphere_Finterface_total_mN",
         "top_sphere_Ftot_mN",
         "top_sphere_force_mN",
     ]
@@ -902,16 +954,59 @@ def _save_output_csv(history: list[dict], out_dir: Path) -> Path:
                     "water_vol_error_rel": float(row.get("water_vol_error_rel", 0.0)),
                     "water_vol_error_percent": float(row.get("water_vol_error_percent", 0.0)),
                     "water_filled_mesh_volume_uL": float(row.get("water_filled_mesh_volume_uL", 0.0)),
-                    "p0_lg_heron_pa": float(row.get("p0_lg_heron_pa", 0.0)),
-                    "p0_lg_vertex_count": int(row.get("p0_lg_vertex_count", 0)),
+                    "p0_neck_fit_pa": float(row.get("p0_neck_fit_pa", 0.0)),
+                    "p0_neck_fit_delta_p_pa": float(row.get("p0_neck_fit_delta_p_pa", 0.0)),
+                    "p0_neck_fit_H_1pm": float(row.get("p0_neck_fit_H_1pm", 0.0)),
+                    "diagnostic_lv_H_avg_1pm": float(row.get("diagnostic_lv_H_avg_1pm", 0.0)),
+                    "diagnostic_lv_H_avg_vertex_count": int(row.get("diagnostic_lv_H_avg_vertex_count", 0)),
+                    "p0_neck_fit_radius_mm": float(row.get("p0_neck_fit_radius_mm", 0.0)),
+                    "p0_neck_fit_rz": float(row.get("p0_neck_fit_rz", 0.0)),
+                    "p0_neck_fit_rzz_1pm": float(row.get("p0_neck_fit_rzz_1pm", 0.0)),
+                    "p0_neck_fit_vertex_count": int(row.get("p0_neck_fit_vertex_count", 0)),
+                    "p0_neck_fit_half_window_rings": int(row.get("p0_neck_fit_half_window_rings", 0)),
+                    "p0_neck_fit_degree": int(row.get("p0_neck_fit_degree", 0)),
+                    "p0_neck_ring_index": int(row.get("p0_neck_ring_index", -1)),
                     "Ftopspherecap_p0_mN": float(row.get("Ftopspherecap_p0_mN", 0.0)),
                     "top_cl_avg_ux_mps": float(row.get("top_cl_avg_ux_mps", 0.0)),
                     "top_cl_avg_uy_mps": float(row.get("top_cl_avg_uy_mps", 0.0)),
                     "top_cl_avg_uz_mps": float(row.get("top_cl_avg_uz_mps", 0.0)),
+                    "top_cl_avg_ucl_x_mps": float(row.get("top_cl_avg_ucl_x_mps", row.get("top_cl_avg_ux_mps", 0.0))),
+                    "top_cl_avg_ucl_y_mps": float(row.get("top_cl_avg_ucl_y_mps", row.get("top_cl_avg_uy_mps", 0.0))),
+                    "top_cl_avg_ucl_z_mps": float(row.get("top_cl_avg_ucl_z_mps", row.get("top_cl_avg_uz_mps", 0.0))),
+                    "top_cl_avg_dxyz_x_m": float(row.get("top_cl_avg_dxyz_x_m", 0.0)),
+                    "top_cl_avg_dxyz_y_m": float(row.get("top_cl_avg_dxyz_y_m", 0.0)),
+                    "top_cl_avg_dxyz_z_m": float(row.get("top_cl_avg_dxyz_z_m", 0.0)),
+                    "top_cl_radius_m": float(row.get("top_cl_radius_m", 0.0)),
+                    "top_cl_radius_mm": float(row.get("top_cl_radius_mm", 0.0)),
+                    "top_cl_vertex_count": int(row.get("top_cl_vertex_count", 0)),
+                    "top_cl_avg_Fp0_mN": float(row.get("top_cl_avg_Fp0_mN", 0.0)),
+                    "top_cl_avg_Fp_flow_mN": float(row.get("top_cl_avg_Fp_flow_mN", 0.0)),
+                    "top_cl_avg_Ftau_mN": float(row.get("top_cl_avg_Ftau_mN", 0.0)),
+                    "top_cl_avg_Fhydro_mN": float(row.get("top_cl_avg_Fhydro_mN", 0.0)),
+                    "top_cl_avg_Fp_mN": float(row.get("top_cl_avg_Fp_mN", 0.0)),
+                    "top_cl_avg_Fs_mN": float(row.get("top_cl_avg_Fs_mN", 0.0)),
+                    "top_cl_avg_Fv_mN": float(row.get("top_cl_avg_Fv_mN", 0.0)),
+                    "top_cl_avg_Fcl_mN": float(row.get("top_cl_avg_Fcl_mN", 0.0)),
+                    "top_cl_avg_Fcl_static_mN": float(row.get("top_cl_avg_Fcl_static_mN", 0.0)),
+                    "top_cl_avg_Fcl_dynamic_minus_static_mN": float(row.get("top_cl_avg_Fcl_dynamic_minus_static_mN", 0.0)),
+                    "top_cl_avg_Finterface_total_mN": float(row.get("top_cl_avg_Finterface_total_mN", 0.0)),
+                    "top_cl_avg_Ftot_mN": float(row.get("top_cl_avg_Ftot_mN", 0.0)),
+                    "top_sphere_Fp0_mN": float(row.get("top_sphere_Fp0_mN", 0.0)),
+                    "top_sphere_Fp_flow_mN": float(row.get("top_sphere_Fp_flow_mN", 0.0)),
+                    "top_sphere_Fp_flow_stokes_mN": float(row.get("top_sphere_Fp_flow_stokes_mN", 0.0)),
+                    "top_sphere_Fp_flow_lub_mN": float(row.get("top_sphere_Fp_flow_lub_mN", row.get("top_sphere_Fp_flow_mN", 0.0))),
+                    "top_sphere_Fp_flow_raw_plus_lub_mN": float(row.get("top_sphere_Fp_flow_raw_plus_lub_mN", row.get("top_sphere_Fp_flow_mN", 0.0))),
+                    "top_sphere_Ftau_mN": float(row.get("top_sphere_Ftau_mN", 0.0)),
+                    "top_sphere_Fhydro_mN": float(row.get("top_sphere_Fhydro_mN", 0.0)),
                     "top_sphere_Fp_mN": float(row.get("top_sphere_Fp_mN", 0.0)),
                     "top_sphere_Fs_mN": float(row.get("top_sphere_Fs_mN", 0.0)),
                     "top_sphere_Fv_mN": float(row.get("top_sphere_Fv_mN", 0.0)),
                     "top_sphere_Fcl_mN": float(row.get("top_sphere_Fcl_mN", 0.0)),
+                    "top_sphere_Fcl_static_mN": float(row.get("top_sphere_Fcl_static_mN", 0.0)),
+                    "top_sphere_Fcl_dynamic_minus_static_mN": float(row.get("top_sphere_Fcl_dynamic_minus_static_mN", 0.0)),
+                    "top_sphere_dF_blackwhite_mN": float(row.get("top_sphere_dF_blackwhite_mN", 0.0)),
+                    "experiment_first_dF_blackwhite_mN": float(PITOIS_FIG5_FIRST_DF_BLACKWHITE_SIGNED_MN),
+                    "top_sphere_Finterface_total_mN": float(row.get("top_sphere_Finterface_total_mN", 0.0)),
                     "top_sphere_Ftot_mN": float(row.get("top_sphere_Ftot_mN", 1.0e3 * top_sphere_force_n)),
                     "top_sphere_force_mN": 1.0e3 * top_sphere_force_n,
                 }
@@ -1369,17 +1464,18 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
         print(f"Gravity acceleration      = {config.gravity_mps2:.3f} m/s^2")
     print(f"Internal pressure offset  = {config.internal_pressure_pa:.3e} Pa")
     print(f"Continuity pressure seed  = {config.continuity_pressure_pa:.3e} Pa")
-    print("Static capillary pressure = off")
+    print("Static capillary pressure = neck meridian-fit Young-Laplace p0")
     print("Interface surface force   = Heron curvature operator")
     print("Contact-line force        = Cox-angle capillary line force")
     print(f"Contact angle assumption  = {config.contact_angle_deg:.1f} deg (literature-informed baseline)")
     print(f"Moving-sphere speed       = {config.cap_speed * 1e6:.3f} um/s")
     print(f"Relative speed            = {config.relative_speed * 1e6:.3f} um/s")
+    print(f"Lubrication speed factor  = {config.lubrication_relative_speed_factor:.3f}")
     print("Fixed sphere              = top sphere (balance side)")
     print("Moving sphere             = bottom sphere (stage side)")
     print(f"Integration substeps      = {config.integration_substeps}")
-    print(f"Contact-radius samples    = {config.contact_radius_samples}")
-    print("Pressure force            = internal/continuity pressure in liquid stress")
+    print("Flow velocity             = sparse Stokes/continuity solve")
+    print("Pressure force            = static p0 + Stokes pressure in liquid stress")
     print("Fp,proj                   = removed")
     print(f"No-swirl enforcement      = {'on' if config.enforce_no_swirl else 'off'}")
     if config.dt > 0.0 and not config.enable_adaptive_dt:
@@ -1481,6 +1577,19 @@ def run_motion_case(
                     f"bottom_sphere_force_n {bottom_sphere_force_mn:+.6e} mN, "
                     f"|top| {abs(top_sphere_force_mn):.6e} mN, "
                     f"|bottom| {abs(bottom_sphere_force_mn):.6e} mN",
+                    flush=True,
+                )
+                print(
+                    "F top breakdown          = "
+                    f"Fp0 {float(record_row.get('top_sphere_Fp0_mN', 0.0)):+.6e} mN, "
+                    f"Fp_flow {float(record_row.get('top_sphere_Fp_flow_mN', 0.0)):+.6e} mN, "
+                    f"Fp_flow_lub {float(record_row.get('top_sphere_Fp_flow_lub_mN', 0.0)):+.6e} mN, "
+                    f"Fp_flow_stokes_diag {float(record_row.get('top_sphere_Fp_flow_stokes_mN', 0.0)):+.6e} mN, "
+                    f"Ftau {float(record_row.get('top_sphere_Ftau_mN', 0.0)):+.6e} mN, "
+                    f"FCL {float(record_row.get('top_sphere_Fcl_mN', 0.0)):+.6e} mN, "
+                    f"dFCL {float(record_row.get('top_sphere_Fcl_dynamic_minus_static_mN', 0.0)):+.6e} mN, "
+                    f"dF_blackwhite {float(record_row.get('top_sphere_dF_blackwhite_mN', 0.0)):+.6e} mN, "
+                    f"Ftop {float(record_row.get('top_sphere_Ftot_mN', top_sphere_force_mn)):+.6e} mN",
                     flush=True,
                 )
         history.append(record_row if record_row is not None else _step_record(state, step=completed_step, t=state.elapsed_time_s))
