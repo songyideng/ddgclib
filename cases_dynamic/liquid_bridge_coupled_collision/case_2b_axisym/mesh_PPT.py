@@ -24,20 +24,33 @@ DEFAULT_MSH_FILE = (
 
 # USER CONTROLS
 # Edit these values when you want a different default interactive view.
-USER_INTERACTIVE_ELEV_DEG = 15.0 #0# # side-on reference: 0
+USER_INTERACTIVE_ELEV_DEG = 45.0 #0# # side-on reference: 0
 USER_INTERACTIVE_AZIM_DEG = 45.0  #90# # side-on reference: -87
+#USER_INTERACTIVE_ELEV_DEG = 0.0 #0# # side-on reference: 0
+#USER_INTERACTIVE_AZIM_DEG = 90.0  #90# # side-on reference: -87
 USER_LIQUID_BRIDGE_ALPHA = 1
 USER_SPHERE_ALPHA = 1
 USER_SPHERE_VISIBLE_FRACTION = 1.0 / 10 #0.028#
+USER_SHOW_SPHERES = False
+USER_SHOW_COORDINATE_SYSTEM = False
+USER_SHOW_COORDINATE_ARROWS = True
+USER_COORDINATE_ARROW_LENGTH_MM = 0.20
+USER_COORDINATE_ARROW_GAP_MM = 0.08
+USER_COORDINATE_ARROW_LINEWIDTH = 1.3
+USER_COORDINATE_ARROW_LABEL_SIZE = 7
+USER_SAVE_PNG = True
+USER_SAVE_PNG_NAME = "mesh_PPT.png"
+USER_TRIM_PNG_WHITESPACE = True
+USER_TRIM_PNG_PAD_PX = 18
 USER_VERTEX_SIZE = 0.0
-USER_X_LIMITS_MM = (-3.0, 3.0)
-USER_Y_LIMITS_MM = (-3.0, 3.0)
-USER_Z_LIMITS_MM = (-2, 2)
+USER_X_LIMITS_MM = None
+USER_Y_LIMITS_MM = None
+USER_Z_LIMITS_MM = None
 USER_CLIP_TO_AXIS_LIMITS = True
 
 DEFAULT_PARTICLE_RADIUS_M = 4.0e-3
-LIQUID_FACE_COLOR = "#8fb0c5"
-LIQUID_EDGE_COLOR = "#637988"
+LIQUID_FACE_COLOR = "#acd2e9"
+LIQUID_EDGE_COLOR = "#5C748B"
 SPHERE_FACE_COLOR = "#c8c6bc"
 
 
@@ -72,7 +85,20 @@ def _build_cli() -> argparse.ArgumentParser:
         default=DEFAULT_PARTICLE_RADIUS_M * 1.0e3,
         help="Particle sphere radius in mm. Default: 4.0",
     )
-    parser.add_argument("--no-spheres", action="store_true", help="Hide the two particle spheres.")
+    sphere_group = parser.add_mutually_exclusive_group()
+    sphere_group.add_argument(
+        "--show-spheres",
+        dest="show_spheres",
+        action="store_true",
+        default=USER_SHOW_SPHERES,
+        help="Show the two particle spheres.",
+    )
+    sphere_group.add_argument(
+        "--no-spheres",
+        dest="show_spheres",
+        action="store_false",
+        help="Hide the two particle spheres.",
+    )
     parser.add_argument(
         "--full-spheres",
         action="store_true",
@@ -94,7 +120,84 @@ def _build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--y-limits", nargs=2, type=float, default=USER_Y_LIMITS_MM, metavar=("MIN", "MAX"), help="Initial y-axis display limits in mm.")
     parser.add_argument("--z-limits", nargs=2, type=float, default=USER_Z_LIMITS_MM, metavar=("MIN", "MAX"), help="Initial z-axis display limits in mm.")
     parser.add_argument("--no-axis-clip", action="store_true", help="Allow geometry outside the configured axis limits to remain visible.")
-    parser.add_argument("--save", type=Path, default=None, help="Optional PNG path to save the displayed surface.")
+    coord_group = parser.add_mutually_exclusive_group()
+    coord_group.add_argument(
+        "--show-coordinate-system",
+        dest="show_coordinate_system",
+        action="store_true",
+        default=USER_SHOW_COORDINATE_SYSTEM,
+        help="Show axes, labels, grid, and title.",
+    )
+    coord_group.add_argument(
+        "--hide-coordinate-system",
+        dest="show_coordinate_system",
+        action="store_false",
+        help="Hide axes, labels, grid, and title.",
+    )
+    coord_arrow_group = parser.add_mutually_exclusive_group()
+    coord_arrow_group.add_argument(
+        "--show-coordinate-arrows",
+        dest="show_coordinate_arrows",
+        action="store_true",
+        default=USER_SHOW_COORDINATE_ARROWS,
+        help="Show a small colored XYZ coordinate arrow triad next to the mesh.",
+    )
+    coord_arrow_group.add_argument(
+        "--hide-coordinate-arrows",
+        dest="show_coordinate_arrows",
+        action="store_false",
+        help="Hide the colored XYZ coordinate arrow triad.",
+    )
+    parser.add_argument(
+        "--coordinate-arrow-length-mm",
+        type=float,
+        default=USER_COORDINATE_ARROW_LENGTH_MM,
+        help="Length of the in-scene coordinate arrows in mm.",
+    )
+    parser.add_argument(
+        "--coordinate-arrow-gap-mm",
+        type=float,
+        default=USER_COORDINATE_ARROW_GAP_MM,
+        help="Gap between the mesh bounding box and the coordinate arrow triad in mm.",
+    )
+    parser.add_argument(
+        "--coordinate-arrow-linewidth",
+        type=float,
+        default=USER_COORDINATE_ARROW_LINEWIDTH,
+        help="Line width of the coordinate arrows.",
+    )
+    parser.add_argument(
+        "--coordinate-arrow-label-size",
+        type=float,
+        default=USER_COORDINATE_ARROW_LABEL_SIZE,
+        help="Font size of the X/Y/Z coordinate arrow labels.",
+    )
+    parser.add_argument(
+        "--save",
+        type=Path,
+        default=SCRIPT_DIR / USER_SAVE_PNG_NAME if USER_SAVE_PNG else None,
+        help="PNG path to save. Default: mesh_PPT.png next to this script.",
+    )
+    trim_group = parser.add_mutually_exclusive_group()
+    trim_group.add_argument(
+        "--trim-png",
+        dest="trim_png",
+        action="store_true",
+        default=USER_TRIM_PNG_WHITESPACE,
+        help="Trim white margins from the saved PNG.",
+    )
+    trim_group.add_argument(
+        "--no-trim-png",
+        dest="trim_png",
+        action="store_false",
+        help="Keep the full Matplotlib figure canvas in the saved PNG.",
+    )
+    parser.add_argument(
+        "--trim-png-pad-px",
+        type=int,
+        default=USER_TRIM_PNG_PAD_PX,
+        help="White padding to keep around the trimmed PNG.",
+    )
     parser.add_argument("--no-show", action="store_true", help="Do not open a window; useful with --save.")
     return parser
 
@@ -119,7 +222,6 @@ def _configure_matplotlib(*, no_show: bool) -> None:
 def _tetra_blocks(mesh: meshio.Mesh) -> np.ndarray:
     blocks: list[np.ndarray] = []
     for cell_block in mesh.cells:
-        print(cell_block.type, cell_block.data.shape)
         if cell_block.type in {"tetra", "tetra10"}:
             blocks.append(np.asarray(cell_block.data[:, :4], dtype=int))
     if not blocks:
@@ -393,6 +495,116 @@ def _sphere_cap_phi_limits(
     return phi_outer, contact_phi
 
 
+def _trim_png_whitespace(path: Path, *, pad_px: int) -> None:
+    try:
+        from PIL import Image
+    except ImportError:
+        print("Warning: Pillow is not available; saved PNG was not whitespace-trimmed.")
+        return
+
+    with Image.open(path) as image:
+        rgba = image.convert("RGBA")
+        pixels = np.asarray(rgba)
+        alpha = pixels[:, :, 3] > 0
+        non_white = np.any(pixels[:, :, :3] < 250, axis=2) & alpha
+        if not np.any(non_white):
+            return
+
+        ys, xs = np.nonzero(non_white)
+        pad = max(int(pad_px), 0)
+        left = max(int(xs.min()) - pad, 0)
+        upper = max(int(ys.min()) - pad, 0)
+        right = min(int(xs.max()) + pad + 1, rgba.width)
+        lower = min(int(ys.max()) + pad + 1, rgba.height)
+        rgba.crop((left, upper, right, lower)).save(path)
+
+
+def _coordinate_triad_geometry(
+    mesh_coords: np.ndarray,
+    *,
+    length_mm: float,
+    gap_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    xyz = np.asarray(mesh_coords, dtype=float).reshape((-1, 3))
+    mins = xyz.min(axis=0)
+    maxs = xyz.max(axis=0)
+    length = max(float(length_mm), 0.0)
+    gap = max(float(gap_mm), 0.0)
+
+    origin = np.array(
+        (
+            mins[0] - gap - length,
+            maxs[1] + gap,
+            mins[2] - gap,
+        ),
+        dtype=float,
+    )
+    directions = np.eye(3, dtype=float)
+    label_scale = 1.35
+    triad_points = [origin]
+    for direction in directions:
+        triad_points.append(origin + length * direction)
+        triad_points.append(origin + label_scale * length * direction)
+    return origin, np.vstack(triad_points)
+
+
+def _add_coordinate_triad(
+    ax,
+    origin: np.ndarray,
+    *,
+    length_mm: float,
+    linewidth: float,
+    label_size: float,
+) -> None:
+    length = max(float(length_mm), 0.0)
+    if length <= 0.0:
+        return
+
+    origin = np.asarray(origin, dtype=float)
+    arrows = (
+        ("X", "#d62728", np.array((1.0, 0.0, 0.0), dtype=float)),
+        ("Y", "#2ca02c", np.array((0.0, 1.0, 0.0), dtype=float)),
+        ("Z", "#1f77b4", np.array((0.0, 0.0, 1.0), dtype=float)),
+    )
+    ax.scatter(
+        [origin[0]],
+        [origin[1]],
+        [origin[2]],
+        s=10,
+        c="#777777",
+        depthshade=False,
+        zorder=30,
+    )
+    for label, color, direction in arrows:
+        vector = length * direction
+        ax.quiver(
+            origin[0],
+            origin[1],
+            origin[2],
+            vector[0],
+            vector[1],
+            vector[2],
+            color=color,
+            linewidth=max(float(linewidth), 0.1),
+            arrow_length_ratio=0.25,
+            normalize=False,
+            zorder=31,
+        )
+        label_pos = origin + 1.25 * vector
+        ax.text(
+            label_pos[0],
+            label_pos[1],
+            label_pos[2],
+            label,
+            color=color,
+            fontsize=max(float(label_size), 1.0),
+            fontweight="bold",
+            ha="center",
+            va="center",
+            zorder=32,
+        )
+
+
 def _plot_surface(
     points: np.ndarray,
     surface_faces: np.ndarray,
@@ -410,6 +622,12 @@ def _plot_surface(
     y_limits_mm: tuple[float, float] | list[float] | None,
     z_limits_mm: tuple[float, float] | list[float] | None,
     clip_to_axis_limits: bool,
+    show_coordinate_system: bool,
+    show_coordinate_arrows: bool,
+    coordinate_arrow_length_mm: float,
+    coordinate_arrow_gap_mm: float,
+    coordinate_arrow_linewidth: float,
+    coordinate_arrow_label_size: float,
 ):
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
@@ -427,6 +645,14 @@ def _plot_surface(
     ax.computed_zorder = False
 
     axis_points = [plot_points[surface_vertices]]
+    coordinate_arrow_origin = None
+    if show_coordinate_arrows:
+        coordinate_arrow_origin, coordinate_arrow_points = _coordinate_triad_geometry(
+            plot_points[surface_vertices],
+            length_mm=float(coordinate_arrow_length_mm),
+            gap_mm=float(coordinate_arrow_gap_mm),
+        )
+        axis_points.append(coordinate_arrow_points)
     if show_spheres:
         (
             bottom_center,
@@ -519,14 +745,30 @@ def _plot_surface(
         z_limits_mm=z_limits_mm,
     )
     _apply_axis_limits(ax, axis_limits)
-    ax.set_xlabel("x [mm]")
-    ax.set_ylabel("y [mm]")
-    ax.set_zlabel("z [mm]")
-    ax.set_title(title, pad=12)
+    if show_coordinate_arrows and coordinate_arrow_origin is not None:
+        _add_coordinate_triad(
+            ax,
+            coordinate_arrow_origin,
+            length_mm=float(coordinate_arrow_length_mm),
+            linewidth=float(coordinate_arrow_linewidth),
+            label_size=float(coordinate_arrow_label_size),
+        )
+    if show_coordinate_system:
+        ax.set_xlabel("x [mm]")
+        ax.set_ylabel("y [mm]")
+        ax.set_zlabel("z [mm]")
+        ax.set_title(title, pad=12)
+        ax.grid(True, alpha=0.28)
+    else:
+        ax.set_axis_off()
+        ax.grid(False)
     ax.set_proj_type("ortho")
     ax.view_init(elev=float(elev), azim=float(azim))
-    ax.grid(True, alpha=0.28)
-    fig.tight_layout()
+    if show_coordinate_system:
+        fig.tight_layout()
+    else:
+        ax.set_position((0.0, 0.0, 1.0, 1.0))
+        fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
     return fig
 
 
@@ -577,7 +819,7 @@ def main() -> None:
         elev=args.elev,
         azim=args.azim,
         sphere_radius_m=float(args.sphere_radius_mm) * 1.0e-3,
-        show_spheres=not bool(args.no_spheres),
+        show_spheres=bool(args.show_spheres),
         liquid_alpha=float(args.liquid_alpha),
         sphere_alpha=float(args.sphere_alpha),
         sphere_visible_fraction=1.0 if bool(args.full_spheres) else float(args.sphere_visible_fraction),
@@ -586,12 +828,20 @@ def main() -> None:
         y_limits_mm=args.y_limits,
         z_limits_mm=args.z_limits,
         clip_to_axis_limits=bool(USER_CLIP_TO_AXIS_LIMITS) and not bool(args.no_axis_clip),
+        show_coordinate_system=bool(args.show_coordinate_system),
+        show_coordinate_arrows=bool(args.show_coordinate_arrows),
+        coordinate_arrow_length_mm=float(args.coordinate_arrow_length_mm),
+        coordinate_arrow_gap_mm=float(args.coordinate_arrow_gap_mm),
+        coordinate_arrow_linewidth=float(args.coordinate_arrow_linewidth),
+        coordinate_arrow_label_size=float(args.coordinate_arrow_label_size),
     )
 
     if args.save is not None:
         save_path = Path(args.save).expanduser().resolve()
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=180, bbox_inches="tight")
+        fig.savefig(save_path, dpi=220, bbox_inches="tight", pad_inches=0.0)
+        if bool(args.trim_png) and save_path.suffix.lower() == ".png":
+            _trim_png_whitespace(save_path, pad_px=int(args.trim_png_pad_px))
         print("Wrote:", save_path)
 
     if args.no_show:

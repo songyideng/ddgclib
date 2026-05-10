@@ -252,13 +252,16 @@ USER_ABORT_ON_NONFINITE_STATE = True
 USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION = False
 USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL = 5.0e-3
 USER_MAX_VOLUME_REL_ERROR_FOR_ABORT = 0.25
-USER_ENABLE_CONTACT_LINE_VOLUME_SLIDE = True
+USER_ENABLE_CONTACT_LINE_VOLUME_SLIDE = False
 USER_CONTACT_LINE_VOLUME_SLIDE_TRIGGER_REL = 5.0e-5
 USER_CONTACT_LINE_VOLUME_SLIDE_MIN_RADIUS_FRACTION = 0.15
 USER_CONTACT_LINE_VOLUME_SLIDE_MAX_RADIUS_FRACTION = 1.05
-USER_ENABLE_POSITION_VOLUME_CONSTRAINT = True
+USER_ENABLE_POSITION_VOLUME_CONSTRAINT = False
 USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL = 1.0e-5
 USER_POSITION_VOLUME_CONSTRAINT_MAX_ITERS = 8
+USER_ENABLE_KINEMATIC_VOLUME_CONSTRAINT = True
+USER_KINEMATIC_VOLUME_CONSTRAINT_REL_TOL = 1.0e-8
+USER_KINEMATIC_VOLUME_CONSTRAINT_MAX_ITERS = 40
 # Eq. 3 pressure is evaluated from a local quadratic neck fit.  The single
 # waist ring is excluded because its discrete cusp otherwise dominates d2r/dz2.
 USER_PRESSURE_NECK_FIT_SIDE_RINGS = 2
@@ -271,6 +274,7 @@ USER_CONTACT_LINE_CONTINUATION_WEIGHT = 0.02
 USER_CONTACT_LINE_FIT_RINGS = 4
 USER_CONTACT_LINE_COX_MACRO_LENGTH_M = 1.0e-3
 USER_CONTACT_LINE_COX_SLIP_LENGTH_M = 2.0e-9
+USER_USE_COX_CONTACT_LINE_FORCE = True
 # The run loops honor this value now. Keep the default serial because this
 # operator is Python/object-graph heavy; 8 ThreadPool workers tested slower on
 # the current axisymmetric force-cache path. Raise manually after benchmarking.
@@ -383,6 +387,7 @@ class VolumetricPitoisConfig:
     contact_line_fit_rings: int = USER_CONTACT_LINE_FIT_RINGS
     contact_line_cox_macro_length_m: float = USER_CONTACT_LINE_COX_MACRO_LENGTH_M
     contact_line_cox_slip_length_m: float = USER_CONTACT_LINE_COX_SLIP_LENGTH_M
+    use_cox_contact_line_force: bool = USER_USE_COX_CONTACT_LINE_FORCE
     accel_workers: int = USER_ACCEL_WORKERS
     enforce_no_swirl: bool = USER_ENFORCE_NO_SWIRL
     # Literature-informed baseline for silicone oil on clean oxide-like solids
@@ -1963,9 +1968,72 @@ def _ring_segment_length_map(ring: list) -> dict[int, float]:
     return seg_map
 
 
+def _cox_contact_line_signed_speed(state: VolumetricPitoisState, *, which: str) -> float:
+    if which == "top":
+        ring = state.top_contact_ring
+    else:
+        ring = state.bottom_contact_ring
+    if not ring:
+        return 0.0
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    sphere_center = top_center if which == "top" else bottom_center
+    return float(
+        _contact_line_ring_speed(
+            state,
+            ring=ring,
+            sphere_center=sphere_center,
+            axis=axis,
+            which=which,
+        )
+    )
+
+
+def _cox_uy_contact_line_liquid_force_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
+    cached = getattr(state, "_cox_uy_contact_line_force_cache", None)
+    if cached is not None:
+        return cached
+
+    force_map: dict[int, np.ndarray] = {}
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    theta_eq = float(np.deg2rad(state.config.contact_angle_deg))
+    gamma = float(state.config.gamma)
+
+    for which, ring, sphere_center in (
+        ("bottom", state.bottom_contact_ring, bottom_center),
+        ("top", state.top_contact_ring, top_center),
+    ):
+        if not ring:
+            continue
+        speed = _cox_contact_line_signed_speed(state, which=which)
+        theta_dyn = _dynamic_contact_angle_from_speed(state, slide_speed=speed)
+        young_coeff = gamma * (float(np.cos(theta_dyn)) - float(np.cos(theta_eq)))
+        seg_map = _ring_segment_length_map(ring)
+        for v in ring:
+            point = np.asarray(v.x_a[:3], dtype=float)
+            slide_dir = _contact_line_slide_direction(
+                point,
+                sphere_center=np.asarray(sphere_center, dtype=float),
+                axis=axis,
+                which=which,
+            )
+            if float(np.linalg.norm(slide_dir)) <= 1.0e-30:
+                continue
+            ell_i = max(float(seg_map.get(id(v), 0.0)), 0.0)
+            force = young_coeff * ell_i * slide_dir
+            if np.all(np.isfinite(force)):
+                force_map[id(v)] = force_map.get(id(v), np.zeros(3, dtype=float)) + force
+
+    state._cox_uy_contact_line_force_cache = force_map
+    return force_map
+
+
 def _Fcl(v, *, state: VolumetricPitoisState) -> np.ndarray:
-    # Surface tension in this case is supplied only by the validated Heron
-    # operator path, via _surface_tension_force_heron().
+    if bool(getattr(state, "gmsh_compute_mesh", False)) and bool(
+        getattr(state.config, "use_cox_contact_line_force", USER_USE_COX_CONTACT_LINE_FORCE)
+    ):
+        force = _cox_uy_contact_line_liquid_force_map(state).get(id(v))
+        if force is not None:
+            return np.asarray(force[:3], dtype=float)
     return np.zeros(3, dtype=float)
 
 
@@ -3308,6 +3376,7 @@ def _axisym_clear_caches(state: VolumetricPitoisState) -> None:
         "_gmsh_axisym_force_cache",
         "_gmsh_axisym_accel_cache",
         "_gmsh_surface_heron_force_cache",
+        "_cox_uy_contact_line_force_cache",
     ):
         if hasattr(state, attr):
             delattr(state, attr)
@@ -4472,6 +4541,297 @@ def _apply_gmsh_position_volume_constraint(state: VolumetricPitoisState) -> None
     _axisym_clear_caches(state)
 
 
+def _gmsh_trial_axisymmetrize_points(state: VolumetricPitoisState, trial_points: np.ndarray) -> None:
+    if (not bool(USER_ENFORCE_FULL_AXISYMMETRY)) or (not bool(getattr(state, "gmsh_compute_mesh", False))):
+        return
+    specs = list(getattr(state, "gmsh_axisym_ring_specs", []))
+    if not specs:
+        return
+
+    mid, axis, e1, e2 = _gmsh_axisym_basis(state)
+    radius = float(state.config.particle_radius)
+    node_id_map = dict(getattr(state, "volume_export_node_ids", {}))
+    for spec in specs:
+        spec_vertices = list(getattr(spec, "vertices", []))
+        point_indices = [node_id_map.get(id(vertex)) for vertex in spec_vertices]
+        if not point_indices or any(idx is None for idx in point_indices):
+            continue
+        point_indices = [int(idx) for idx in point_indices]
+        coords = trial_points[point_indices]
+        rel = coords - mid[None, :]
+        axial = np.dot(rel, axis)
+        radial = rel - np.outer(axial, axis)
+        r_mean = float(np.mean(np.linalg.norm(radial, axis=1)))
+        cap_id = _gmsh_axisym_uniform_cap_id(spec_vertices)
+        if cap_id is None:
+            center_coord = mid + float(np.mean(axial)) * axis
+        else:
+            sphere_center = (
+                np.asarray(state.bottom_sphere_center, dtype=float)
+                if cap_id == "bottom"
+                else np.asarray(state.top_sphere_center, dtype=float)
+            )
+            sign = 1.0 if cap_id == "bottom" else -1.0
+            r_mean = float(np.clip(r_mean, 0.0, radius))
+            center_coord = sphere_center + sign * math.sqrt(max(radius * radius - r_mean * r_mean, 0.0)) * axis
+
+        angles = tuple(getattr(spec, "angles", ()))
+        if len(point_indices) == 1 or r_mean <= 1.0e-30:
+            for point_idx in point_indices:
+                trial_points[point_idx] = center_coord
+        else:
+            for point_idx, angle in zip(point_indices, angles):
+                e_r = float(np.cos(angle)) * e1 + float(np.sin(angle)) * e2
+                trial_points[point_idx] = center_coord + r_mean * e_r
+
+
+def _gmsh_trial_contact_lines_to_spheres(state: VolumetricPitoisState, trial_points: np.ndarray) -> None:
+    radius = float(state.config.particle_radius)
+    node_id_map = dict(getattr(state, "volume_export_node_ids", {}))
+    for ring, sphere_center in (
+        (state.bottom_contact_ring, np.asarray(state.bottom_sphere_center, dtype=float)),
+        (state.top_contact_ring, np.asarray(state.top_sphere_center, dtype=float)),
+    ):
+        for vertex in ring:
+            point_idx = node_id_map.get(id(vertex))
+            if point_idx is None:
+                continue
+            point_idx = int(point_idx)
+            rel = trial_points[point_idx] - sphere_center
+            rel_norm = float(np.linalg.norm(rel))
+            if rel_norm <= 1.0e-30:
+                continue
+            trial_points[point_idx] = sphere_center + radius * (rel / rel_norm)
+
+
+def _gmsh_project_trial_points_to_constraints(state: VolumetricPitoisState, trial_points: np.ndarray) -> None:
+    # These are the same moving-boundary constraints applied to the live mesh.
+    # Running them during volume searches keeps the accepted correction
+    # kinematically consistent with the positions that will actually be used.
+    for _projection_pass in range(2):
+        _gmsh_trial_axisymmetrize_points(state, trial_points)
+        _gmsh_trial_contact_lines_to_spheres(state, trial_points)
+
+
+def _gmsh_set_velocities_from_displacement(
+    state: VolumetricPitoisState,
+    *,
+    reference_positions: np.ndarray,
+    dt: float,
+) -> None:
+    if float(dt) <= 0.0:
+        return
+    vertices = list(getattr(state, "volume_export_vertices", []))
+    points = _volume_points_array(state)
+    reference = np.asarray(reference_positions, dtype=float)
+    if reference.shape != points.shape or len(vertices) != points.shape[0]:
+        return
+    velocity = (points - reference) / float(dt)
+    if not np.all(np.isfinite(velocity)):
+        velocity = np.nan_to_num(velocity, nan=0.0, posinf=0.0, neginf=0.0)
+    for idx, vertex in enumerate(vertices):
+        vertex.u = np.asarray(velocity[idx], dtype=float)
+    _enforce_no_swirl_velocity_field(state)
+    _set_cap_velocities(state)
+    _project_gmsh_contact_line_velocities_to_sphere_tangents(state)
+    _axisym_clear_caches(state)
+
+
+def _apply_gmsh_kinematic_volume_constraint(
+    state: VolumetricPitoisState,
+    *,
+    dt: float,
+    reference_positions: np.ndarray,
+) -> None:
+    state.last_position_volume_constraint_status = "not_run"
+    state.last_position_volume_constraint_rel_before = 0.0
+    state.last_position_volume_constraint_rel_after = 0.0
+    state.last_gmsh_cl_volume_slide_status = "not_used_kinematic"
+    state.last_gmsh_cl_volume_slide_scale = 1.0
+    state.last_gmsh_cl_volume_slide_rel_before = 0.0
+    state.last_gmsh_cl_volume_slide_rel_after = 0.0
+    if (
+        (not bool(getattr(state, "gmsh_compute_mesh", False)))
+        or (not bool(getattr(state.config, "enable_incompressible_projection", False)))
+        or (not bool(USER_ENABLE_KINEMATIC_VOLUME_CONSTRAINT))
+    ):
+        state.last_position_volume_constraint_status = "disabled"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
+    if (not np.isfinite(target)) or target <= 0.0:
+        state.last_position_volume_constraint_status = "bad_target"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    vertices = list(getattr(state, "volume_export_vertices", []))
+    tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
+    if (not vertices) or tets.size == 0:
+        state.last_position_volume_constraint_status = "empty_mesh"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    base_points = _volume_points_array(state)
+    current = float(_indexed_tet_mesh_volume_m3(base_points, tets))
+    if (not np.isfinite(current)) or current <= 0.0:
+        state.last_position_volume_constraint_status = "bad_current"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    rel_before = float((current - target) / max(target, 1.0e-30))
+    state.last_position_volume_constraint_rel_before = rel_before
+    state.last_position_volume_constraint_rel_after = rel_before
+    state.last_gmsh_cl_volume_slide_rel_before = rel_before
+    state.last_gmsh_cl_volume_slide_rel_after = rel_before
+
+    tol = max(float(USER_KINEMATIC_VOLUME_CONSTRAINT_REL_TOL), 0.0)
+    if abs(rel_before) <= tol:
+        state.last_position_volume_constraint_status = "within_trigger"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    projectable_vertices, projectable_base = _snapshot_projectable_vertex_positions(state)
+    node_id_map = dict(getattr(state, "volume_export_node_ids", {}))
+    projectable_indices = [node_id_map.get(id(vertex)) for vertex in projectable_vertices]
+    if (not projectable_vertices) or any(idx is None for idx in projectable_indices):
+        state.last_position_volume_constraint_status = "no_projectable_vertices"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+    projectable_indices = [int(idx) for idx in projectable_indices]
+
+    def trial_points_at(scale: float) -> np.ndarray | None:
+        try:
+            scaled = _axisym_water_volume_scaled_positions(
+                state,
+                projectable_base,
+                meridional_scale=max(float(scale), 1.0e-6),
+            )
+        except ValueError:
+            return None
+        trial_points = np.asarray(base_points, dtype=float).copy()
+        trial_points[projectable_indices] = scaled
+        _gmsh_project_trial_points_to_constraints(state, trial_points)
+        if not np.all(np.isfinite(trial_points)):
+            return None
+        return trial_points
+
+    def add_candidate(scale: float, candidates: list[tuple[float, float]]) -> None:
+        if not np.isfinite(scale) or scale <= 0.0:
+            return
+        trial_points = trial_points_at(float(scale))
+        if trial_points is None:
+            return
+        volume = float(_indexed_tet_mesh_volume_m3(trial_points, tets))
+        if np.isfinite(volume) and volume > 0.0:
+            candidates.append((float(scale), volume))
+
+    scale_candidates = [
+        0.01,
+        0.02,
+        0.05,
+        0.10,
+        0.15,
+        0.20,
+        0.30,
+        0.40,
+        0.50,
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        0.95,
+        0.98,
+        1.00,
+        1.02,
+        1.05,
+        1.10,
+        1.20,
+        1.40,
+        1.70,
+        2.00,
+        2.50,
+        3.00,
+        4.00,
+        6.00,
+        8.00,
+    ]
+    candidates: list[tuple[float, float]] = []
+    for scale in scale_candidates:
+        add_candidate(scale, candidates)
+    if not candidates:
+        state.last_position_volume_constraint_status = "no_valid_trials"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    candidates = sorted(set(candidates), key=lambda item: item[0])
+    best_scale, best_volume = min(candidates, key=lambda item: abs(item[1] - target))
+    bracket: tuple[tuple[float, float], tuple[float, float]] | None = None
+    for left, right in zip(candidates[:-1], candidates[1:]):
+        f_left = left[1] - target
+        f_right = right[1] - target
+        if abs(f_left) <= max(tol * target, 1.0e-30):
+            bracket = (left, left)
+            break
+        if f_left * f_right <= 0.0:
+            bracket = (left, right)
+            break
+
+    if bracket is not None:
+        left, right = bracket
+        lo_scale, lo_volume = left
+        hi_scale, hi_volume = right
+        if lo_scale == hi_scale:
+            best_scale, best_volume = lo_scale, lo_volume
+        else:
+            lo_f = lo_volume - target
+            hi_f = hi_volume - target
+            for _ in range(max(1, int(USER_KINEMATIC_VOLUME_CONSTRAINT_MAX_ITERS))):
+                mid_scale = 0.5 * (lo_scale + hi_scale)
+                mid_points = trial_points_at(mid_scale)
+                if mid_points is None:
+                    break
+                mid_volume = float(_indexed_tet_mesh_volume_m3(mid_points, tets))
+                if (not np.isfinite(mid_volume)) or mid_volume <= 0.0:
+                    break
+                if abs(mid_volume - target) < abs(best_volume - target):
+                    best_scale, best_volume = mid_scale, mid_volume
+                mid_f = mid_volume - target
+                if abs(mid_f) <= max(tol * target, 1.0e-30):
+                    best_scale, best_volume = mid_scale, mid_volume
+                    break
+                if lo_f * mid_f <= 0.0:
+                    hi_scale, hi_volume, hi_f = mid_scale, mid_volume, mid_f
+                else:
+                    lo_scale, lo_volume, lo_f = mid_scale, mid_volume, mid_f
+
+    final_points = trial_points_at(best_scale)
+    if final_points is None:
+        state.last_position_volume_constraint_status = "bad_final_trial"
+        _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+        return
+
+    _move_vertices_batch(
+        vertices,
+        [tuple(float(x) for x in row) for row in final_points],
+        state.HC,
+        state.bV_caps,
+    )
+    final_volume = float(_snapshot_msh_volume_m3(state))
+    rel_after = float((final_volume - target) / max(target, 1.0e-30))
+    state.last_position_volume_constraint_rel_after = rel_after
+    state.last_gmsh_cl_volume_slide_rel_after = rel_after
+    if abs(rel_after) <= max(tol, float(USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL)):
+        state.last_position_volume_constraint_status = "kinematic_applied"
+    elif abs(final_volume - target) < abs(current - target):
+        state.last_position_volume_constraint_status = "kinematic_best_effort"
+    else:
+        state.last_position_volume_constraint_status = "kinematic_no_improvement"
+
+    _gmsh_set_velocities_from_displacement(state, reference_positions=reference_positions, dt=dt)
+    _axisym_clear_caches(state)
+
+
 def _Ftot(
     v,
     *,
@@ -5031,6 +5391,7 @@ def _advance_gmsh_incompressible_substep(state: VolumetricPitoisState, *, dt: fl
     ):
         return False
 
+    substep_reference_positions = _volume_points_array(state).copy()
     _set_cap_velocities(state)
     _enforce_no_swirl_velocity_field(state)
     _move_caps(state, dt=dt)
@@ -5073,10 +5434,11 @@ def _advance_gmsh_incompressible_substep(state: VolumetricPitoisState, *, dt: fl
     _gmsh_axisymmetrize_state(state)
     _enforce_no_swirl_velocity_field(state)
     _assert_fixed_topology(state)
-    _apply_gmsh_contact_line_volume_slide(state, dt=dt)
-    _apply_gmsh_position_volume_constraint(state)
-    _project_volume_to_target(state)
-    _gmsh_axisymmetrize_state(state)
+    _apply_gmsh_kinematic_volume_constraint(
+        state,
+        dt=dt,
+        reference_positions=substep_reference_positions,
+    )
     _assert_fixed_topology(state)
     _update_duals_and_masses(state)
     _update_pressure_scalar(state)
@@ -7455,6 +7817,11 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
             "Gmsh position volume fix  = "
             f"{'on' if USER_ENABLE_POSITION_VOLUME_CONSTRAINT else 'off'}"
             f" (trigger {USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL:.3e})"
+        )
+        print(
+            "Gmsh kinematic volume     = "
+            f"{'on' if USER_ENABLE_KINEMATIC_VOLUME_CONSTRAINT else 'off'}"
+            f" (tol {USER_KINEMATIC_VOLUME_CONSTRAINT_REL_TOL:.3e})"
         )
     print(
         "Fp,proj trial refinement  = "

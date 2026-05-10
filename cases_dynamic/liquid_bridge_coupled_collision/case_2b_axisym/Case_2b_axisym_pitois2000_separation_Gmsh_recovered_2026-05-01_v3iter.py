@@ -237,7 +237,7 @@ USER_CAP_EDGE_ALPHA = 0.0
 USER_FILL_PARTICLE_CAP_SURFACES = False
 USER_INCLUDE_GRAVITY = True
 USER_GRAVITY_MPS2 = 9.81
-USER_INTEGRATION_SUBSTEPS = 1
+USER_INTEGRATION_SUBSTEPS = 5
 USER_CONTACT_RADIUS_SAMPLES = 128
 # Gmsh path: use a discrete incompressible velocity projection on the loaded
 # tetrahedral mesh instead of the old scalar Fp,proj volume-force controller.
@@ -249,8 +249,12 @@ USER_VOLUME_PROJECTION_MAX_ITERS = 12
 USER_VOLUME_PROJECTION_REL_TOL = 1.0e-6
 USER_MAX_ACCELERATION = 5.0e-3
 USER_ABORT_ON_NONFINITE_STATE = True
-USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION = False
-USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL = 5.0e-3
+USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION = True
+USER_AXISYM_SURFACE_VOLUME_CORRECTION_TRIGGER_REL = 5.0e-5
+USER_AXISYM_SURFACE_VOLUME_CORRECTION_MAX_RADIAL_STEP_UM = 1.0
+USER_AXISYM_SURFACE_VOLUME_CORRECTION_MAX_REL_RADIUS_STEP = 2.0e-3
+USER_AXISYM_SURFACE_VOLUME_CORRECTION_MIN_TET_VOLUME_FRACTION = 0.25
+USER_GMSH_GEOMETRIC_VOLUME_CORRECTION_TRIGGER_REL = USER_AXISYM_SURFACE_VOLUME_CORRECTION_TRIGGER_REL
 USER_MAX_VOLUME_REL_ERROR_FOR_ABORT = 0.25
 USER_ENABLE_CONTACT_LINE_VOLUME_SLIDE = True
 USER_CONTACT_LINE_VOLUME_SLIDE_TRIGGER_REL = 5.0e-5
@@ -258,7 +262,7 @@ USER_CONTACT_LINE_VOLUME_SLIDE_MIN_RADIUS_FRACTION = 0.15
 USER_CONTACT_LINE_VOLUME_SLIDE_MAX_RADIUS_FRACTION = 1.05
 USER_ENABLE_POSITION_VOLUME_CONSTRAINT = True
 USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL = 1.0e-5
-USER_POSITION_VOLUME_CONSTRAINT_MAX_ITERS = 8
+USER_POSITION_VOLUME_CONSTRAINT_MAX_ITERS = 12
 # Eq. 3 pressure is evaluated from a local quadratic neck fit.  The single
 # waist ring is excluded because its discrete cusp otherwise dominates d2r/dz2.
 USER_PRESSURE_NECK_FIT_SIDE_RINGS = 2
@@ -458,6 +462,10 @@ class VolumetricPitoisState:
     last_position_volume_constraint_status: str = "not_run"
     last_position_volume_constraint_rel_before: float = 0.0
     last_position_volume_constraint_rel_after: float = 0.0
+    last_axisym_surface_volume_correction_status: str = "not_run"
+    last_axisym_surface_volume_correction_alpha_m: float = 0.0
+    last_axisym_surface_volume_correction_rel_before: float = 0.0
+    last_axisym_surface_volume_correction_rel_after: float = 0.0
     surface_export_vertices: list = field(default_factory=list)
     surface_export_node_ids: dict[int, int] = field(default_factory=dict)
     surface_export_side_tris: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=int))
@@ -4115,24 +4123,260 @@ def _update_moving_contact_line(state: VolumetricPitoisState, *, dt: float | Non
     _axisym_clear_caches(state)
 
 
+def _axisym_surface_radius_volume_correction(
+    state: VolumetricPitoisState,
+) -> None:
+    state.last_axisym_surface_volume_correction_status = "not_run"
+    state.last_axisym_surface_volume_correction_alpha_m = 0.0
+    state.last_axisym_surface_volume_correction_rel_before = 0.0
+    state.last_axisym_surface_volume_correction_rel_after = 0.0
+
+    if (
+        (not bool(getattr(state, "gmsh_compute_mesh", False)))
+        or (not bool(getattr(state.config, "enable_gmsh_geometric_volume_correction", False)))
+        or (not bool(USER_ENABLE_GMSH_GEOMETRIC_VOLUME_CORRECTION))
+    ):
+        state.last_axisym_surface_volume_correction_status = "disabled"
+        return
+
+    target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
+    current = float(_snapshot_msh_volume_m3(state))
+    if (not np.isfinite(target)) or target <= 0.0:
+        state.last_axisym_surface_volume_correction_status = "bad_target"
+        return
+    if (not np.isfinite(current)) or current <= 0.0:
+        state.last_axisym_surface_volume_correction_status = "bad_current"
+        return
+
+    trigger = max(
+        float(getattr(state.config, "gmsh_geometric_volume_correction_trigger_rel", 0.0)),
+        float(USER_AXISYM_SURFACE_VOLUME_CORRECTION_TRIGGER_REL),
+        0.0,
+    )
+    rel_before = float((current - target) / max(target, 1.0e-30))
+    state.last_axisym_surface_volume_correction_rel_before = rel_before
+    state.last_axisym_surface_volume_correction_rel_after = rel_before
+    if abs(rel_before) <= trigger:
+        state.last_axisym_surface_volume_correction_status = "within_trigger"
+        return
+
+    outer_rings = [list(ring) for ring in state.outer_rings if ring]
+    if len(outer_rings) < 4:
+        state.last_axisym_surface_volume_correction_status = "insufficient_surface"
+        return
+
+    mid, axis, _e1, _e2 = _gmsh_axisym_basis(state)
+    ring_infos: list[dict] = []
+    s_values: list[float] = []
+    for ring_idx, ring in enumerate(outer_rings):
+        coords = np.asarray([np.asarray(v.x_a[:3], dtype=float) for v in ring], dtype=float)
+        rel = coords - mid[None, :]
+        axial = np.dot(rel, axis)
+        radial = rel - np.outer(axial, axis)
+        radii = np.linalg.norm(radial, axis=1)
+        finite = np.isfinite(coords).all(axis=1) & np.isfinite(radii) & (radii > 1.0e-12)
+        if not np.any(finite):
+            continue
+        s_mean = float(np.mean(axial[finite]))
+        radius_mean = float(np.mean(radii[finite]))
+        s_values.append(s_mean)
+        ring_infos.append(
+            {
+                "ring_idx": ring_idx,
+                "ring": ring,
+                "coords": coords,
+                "radii": radii,
+                "radial": radial,
+                "finite": finite,
+                "s": s_mean,
+                "radius": radius_mean,
+            }
+        )
+
+    if len(ring_infos) < 4 or len(s_values) < 4:
+        state.last_axisym_surface_volume_correction_status = "insufficient_profile"
+        return
+    s_min = min(s_values)
+    s_max = max(s_values)
+    s_span = max(s_max - s_min, 1.0e-30)
+
+    profile: list[tuple[float, float, float]] = []
+    movable_infos: list[dict] = []
+    last_ring_idx = len(outer_rings) - 1
+    for info in ring_infos:
+        xi = float(np.clip((float(info["s"]) - s_min) / s_span, 0.0, 1.0))
+        weight = float(np.sin(np.pi * xi) ** 2)
+        profile.append((float(info["s"]), float(info["radius"]), weight))
+        if (
+            int(info["ring_idx"]) in (0, last_ring_idx)
+            or weight <= 1.0e-12
+        ):
+            continue
+        finite = np.asarray(info["finite"], dtype=bool)
+        ring = list(info["ring"])
+        coords = np.asarray(info["coords"], dtype=float)
+        radii = np.asarray(info["radii"], dtype=float)
+        radial = np.asarray(info["radial"], dtype=float)
+        vertices = []
+        base_coords = []
+        unit_radials = []
+        base_radii = []
+        for vertex, coord, radius_value, radial_vec, ok in zip(ring, coords, radii, radial, finite):
+            if (
+                (not bool(ok))
+                or vertex in state.bV_caps
+                or getattr(vertex, "cap_id", None) is not None
+            ):
+                continue
+            vertices.append(vertex)
+            base_coords.append(np.asarray(coord, dtype=float))
+            unit_radials.append(np.asarray(radial_vec, dtype=float) / max(float(radius_value), 1.0e-30))
+            base_radii.append(float(radius_value))
+        if vertices:
+            movable_infos.append(
+                {
+                    "vertices": vertices,
+                    "coords": np.asarray(base_coords, dtype=float),
+                    "unit_radials": np.asarray(unit_radials, dtype=float),
+                    "radii": np.asarray(base_radii, dtype=float),
+                    "weight": weight,
+                }
+            )
+
+    if not movable_infos:
+        state.last_axisym_surface_volume_correction_status = "no_movable_surface"
+        return
+
+    profile.sort(key=lambda item: item[0])
+    s_profile = np.asarray([item[0] for item in profile], dtype=float)
+    integrand = np.asarray([item[1] * item[2] for item in profile], dtype=float)
+    trapezoid = getattr(np, "trapezoid", np.trapz)
+    dV_dalpha = float(2.0 * np.pi * trapezoid(integrand, s_profile))
+    if (not np.isfinite(dV_dalpha)) or abs(dV_dalpha) <= 1.0e-30:
+        state.last_axisym_surface_volume_correction_status = "zero_derivative"
+        return
+
+    mean_radius = float(np.mean([float(info["radius"]) for info in ring_infos]))
+    max_step_abs = max(float(USER_AXISYM_SURFACE_VOLUME_CORRECTION_MAX_RADIAL_STEP_UM), 0.0) * 1.0e-6
+    max_step_rel = max(float(USER_AXISYM_SURFACE_VOLUME_CORRECTION_MAX_REL_RADIUS_STEP), 0.0) * max(
+        mean_radius,
+        1.0e-30,
+    )
+    step_limits = [value for value in (max_step_abs, max_step_rel) if value > 0.0]
+    if not step_limits:
+        state.last_axisym_surface_volume_correction_status = "zero_step_limit"
+        return
+    max_step = min(step_limits)
+    alpha_linear = float((target - current) / dV_dalpha)
+    alpha_trial = float(np.clip(alpha_linear, -max_step, max_step))
+    if (not np.isfinite(alpha_trial)) or abs(alpha_trial) <= 1.0e-15:
+        state.last_axisym_surface_volume_correction_status = "tiny_correction"
+        return
+
+    all_vertices = list(getattr(state, "volume_export_vertices", []))
+    tets = np.asarray(getattr(state, "volume_export_tets", np.empty((0, 4), dtype=int)), dtype=int)
+    if (not all_vertices) or tets.size == 0:
+        state.last_axisym_surface_volume_correction_status = "empty_mesh"
+        return
+    base_positions = _volume_points_array(state)
+    base_signed_six = _indexed_tet_signed_six_volumes(base_positions, tets)
+    base_abs_six = np.abs(base_signed_six)
+    max_abs_six = float(np.max(base_abs_six)) if base_abs_six.size else 0.0
+    active = base_abs_six > max(1.0e-12 * max_abs_six, 1.0e-30)
+    if not np.any(active):
+        state.last_axisym_surface_volume_correction_status = "degenerate_mesh"
+        return
+    base_sign = np.sign(base_signed_six)
+    base_min_abs = float(np.min(base_abs_six[active]))
+    min_volume_fraction = float(
+        np.clip(USER_AXISYM_SURFACE_VOLUME_CORRECTION_MIN_TET_VOLUME_FRACTION, 0.0, 1.0)
+    )
+
+    def restore_base() -> None:
+        _move_vertices_batch(
+            all_vertices,
+            [tuple(float(x) for x in row) for row in base_positions],
+            state.HC,
+            state.bV_caps,
+        )
+        _axisym_clear_caches(state)
+
+    def apply_alpha(alpha: float) -> bool:
+        vertices: list[object] = []
+        targets: list[tuple[float, float, float]] = []
+        for info in movable_infos:
+            dr = float(alpha) * float(info["weight"])
+            coords = np.asarray(info["coords"], dtype=float)
+            unit_radials = np.asarray(info["unit_radials"], dtype=float)
+            radii = np.asarray(info["radii"], dtype=float)
+            if np.any(radii + dr <= np.maximum(1.0e-8 * max(mean_radius, 1.0e-30), 0.05 * radii)):
+                return False
+            for vertex, target in zip(info["vertices"], coords + dr * unit_radials):
+                vertices.append(vertex)
+                targets.append(tuple(float(x) for x in target))
+        if not vertices:
+            return False
+        _move_vertices_batch(vertices, targets, state.HC, state.bV_caps)
+        _gmsh_axisymmetrize_state(state)
+        return True
+
+    def candidate_is_valid() -> bool:
+        points = _volume_points_array(state)
+        signed_six = _indexed_tet_signed_six_volumes(points, tets)
+        if signed_six.shape != base_signed_six.shape or not np.all(np.isfinite(signed_six)):
+            return False
+        if np.any(np.sign(signed_six[active]) != base_sign[active]):
+            return False
+        abs_six = np.abs(signed_six[active])
+        if abs_six.size == 0 or not np.all(np.isfinite(abs_six)):
+            return False
+        if base_min_abs > 0.0 and float(np.min(abs_six)) < min_volume_fraction * base_min_abs:
+            return False
+        return True
+
+    best_alpha = 0.0
+    best_error = abs(current - target)
+    for factor in (1.0, 0.5, 0.25, 0.125, 0.0625):
+        alpha = alpha_trial * factor
+        if abs(alpha) <= 1.0e-15:
+            continue
+        if not apply_alpha(alpha):
+            restore_base()
+            continue
+        trial_volume = float(_snapshot_msh_volume_m3(state))
+        valid = candidate_is_valid()
+        trial_error = abs(trial_volume - target) if np.isfinite(trial_volume) else float("inf")
+        restore_base()
+        if valid and trial_error < best_error:
+            best_alpha = float(alpha)
+            best_error = float(trial_error)
+
+    if best_alpha == 0.0:
+        state.last_axisym_surface_volume_correction_status = "no_valid_improvement"
+        return
+
+    if not apply_alpha(best_alpha):
+        restore_base()
+        state.last_axisym_surface_volume_correction_status = "apply_failed"
+        return
+    final_volume = float(_snapshot_msh_volume_m3(state))
+    final_error = abs(final_volume - target) if np.isfinite(final_volume) else float("inf")
+    if (not candidate_is_valid()) or final_error > best_error * (1.0 + 1.0e-9):
+        restore_base()
+        state.last_axisym_surface_volume_correction_status = "final_rejected"
+        return
+
+    state.last_axisym_surface_volume_correction_status = "applied"
+    state.last_axisym_surface_volume_correction_alpha_m = float(best_alpha)
+    state.last_axisym_surface_volume_correction_rel_after = float(
+        (final_volume - target) / max(target, 1.0e-30)
+    )
+    _axisym_clear_caches(state)
+
+
 def _project_volume_to_target(state: VolumetricPitoisState) -> None:
     if bool(getattr(state, "gmsh_compute_mesh", False)):
-        if bool(getattr(state.config, "enable_gmsh_geometric_volume_correction", False)):
-            target = float(getattr(state, "target_snapshot_volume_m3", 0.0))
-            current = float(_snapshot_msh_volume_m3(state))
-            trigger = max(float(getattr(state.config, "gmsh_geometric_volume_correction_trigger_rel", 0.0)), 0.0)
-            if (
-                np.isfinite(target)
-                and target > 0.0
-                and np.isfinite(current)
-                and abs(current - target) / max(target, 1.0e-30) > trigger
-            ):
-                _axisym_force_snapshot_volume_to_target(
-                    state,
-                    rel_tol=float(state.config.volume_projection_rel_tol),
-                    max_iters=max(1, int(state.config.volume_projection_max_iters)),
-                )
-                _gmsh_axisymmetrize_state(state)
+        _axisym_surface_radius_volume_correction(state)
         _axisym_clear_caches(state)
         return
     if bool(USER_ENFORCE_FULL_AXISYMMETRY):
@@ -4451,12 +4695,29 @@ def _apply_gmsh_position_volume_constraint(state: VolumetricPitoisState) -> None
 
         before = abs(current - target)
         old_positions = points.copy()
-        _move_vertices_batch(movable_vertices, targets, state.HC, state.bV_caps)
-        _gmsh_axisymmetrize_state(state)
-        after_volume = float(_snapshot_msh_volume_m3(state))
-        after = abs(after_volume - target)
-        state.last_position_volume_constraint_rel_after = float((after_volume - target) / max(target, 1.0e-30))
-        if after >= before:
+        best_positions: np.ndarray | None = None
+        best_after = before
+        best_rel_after = rel_current
+        for factor in (1.0, 0.5, 0.25, 0.125, 0.0625):
+            trial_vertices: list[object] = []
+            trial_targets: list[tuple[float, float, float]] = []
+            for idx, vertex in enumerate(vertices):
+                if vertex in fixed:
+                    continue
+                target_pos = points[idx] + float(factor) * displacement[idx]
+                if np.all(np.isfinite(target_pos)):
+                    trial_vertices.append(vertex)
+                    trial_targets.append(tuple(float(x) for x in target_pos))
+            if not trial_vertices:
+                continue
+            _move_vertices_batch(trial_vertices, trial_targets, state.HC, state.bV_caps)
+            _gmsh_axisymmetrize_state(state)
+            after_volume = float(_snapshot_msh_volume_m3(state))
+            after = abs(after_volume - target)
+            if after < best_after:
+                best_after = float(after)
+                best_rel_after = float((after_volume - target) / max(target, 1.0e-30))
+                best_positions = _volume_points_array(state).copy()
             _move_vertices_batch(
                 vertices,
                 [tuple(float(x) for x in row) for row in old_positions],
@@ -4464,9 +4725,20 @@ def _apply_gmsh_position_volume_constraint(state: VolumetricPitoisState) -> None
                 state.bV_caps,
             )
             _gmsh_axisymmetrize_state(state)
+
+        if best_positions is None:
             state.last_position_volume_constraint_rel_after = rel_current
             state.last_position_volume_constraint_status = "no_improvement"
             return
+
+        _move_vertices_batch(
+            vertices,
+            [tuple(float(x) for x in row) for row in best_positions],
+            state.HC,
+            state.bV_caps,
+        )
+        _gmsh_axisymmetrize_state(state)
+        state.last_position_volume_constraint_rel_after = best_rel_after
 
     state.last_position_volume_constraint_status = "max_iters"
     _axisym_clear_caches(state)
@@ -5764,6 +6036,18 @@ def _step_record(state: VolumetricPitoisState, *, step: int, t: float) -> dict[s
         "position_volume_constraint_status": str(getattr(state, "last_position_volume_constraint_status", "not_run")),
         "position_volume_constraint_rel_before": float(getattr(state, "last_position_volume_constraint_rel_before", 0.0)),
         "position_volume_constraint_rel_after": float(getattr(state, "last_position_volume_constraint_rel_after", 0.0)),
+        "axisym_surface_volume_correction_status": str(
+            getattr(state, "last_axisym_surface_volume_correction_status", "not_run")
+        ),
+        "axisym_surface_volume_correction_alpha_m": float(
+            getattr(state, "last_axisym_surface_volume_correction_alpha_m", 0.0)
+        ),
+        "axisym_surface_volume_correction_rel_before": float(
+            getattr(state, "last_axisym_surface_volume_correction_rel_before", 0.0)
+        ),
+        "axisym_surface_volume_correction_rel_after": float(
+            getattr(state, "last_axisym_surface_volume_correction_rel_after", 0.0)
+        ),
         "max_free_speed": _max_free_speed(state),
         "pressure_scalar": float(state.pressure_scalar),
         "n_vertices": sum(1 for _ in state.HC.V),
@@ -6422,6 +6706,19 @@ def _indexed_tet_mesh_volume_m3(points: np.ndarray, tets: np.ndarray) -> float:
     # Never rely on cancellation from mixed element orientation.
     triple = np.einsum("ij,ij->i", pa - pd, np.cross(pb - pd, pc - pd))
     return float(np.sum(np.abs(triple)) / 6.0)
+
+
+def _indexed_tet_signed_six_volumes(points: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=float)
+    tet_idx = np.asarray(tets, dtype=int)
+    if pts.size == 0 or tet_idx.size == 0:
+        return np.empty(0, dtype=float)
+    tet_points = pts[tet_idx]
+    pa = tet_points[:, 0, :]
+    pb = tet_points[:, 1, :]
+    pc = tet_points[:, 2, :]
+    pd = tet_points[:, 3, :]
+    return np.einsum("ij,ij->i", pa - pd, np.cross(pb - pd, pc - pd))
 
 
 def _indexed_tet_volume_gradient(points: np.ndarray, tets: np.ndarray) -> np.ndarray:
@@ -7442,7 +7739,7 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
         getattr(config, "enable_incompressible_projection", False)
     ):
         print(
-            "Gmsh volume correction    = "
+            "Gmsh surface vol. fix     = "
             f"{'on' if config.enable_gmsh_geometric_volume_correction else 'off'}"
             f" (trigger {config.gmsh_geometric_volume_correction_trigger_rel:.3e})"
         )
@@ -7455,6 +7752,10 @@ def _print_header(config: VolumetricPitoisConfig) -> None:
             "Gmsh position volume fix  = "
             f"{'on' if USER_ENABLE_POSITION_VOLUME_CONSTRAINT else 'off'}"
             f" (trigger {USER_POSITION_VOLUME_CONSTRAINT_TRIGGER_REL:.3e})"
+        )
+        print(
+            "Surface radial step cap   = "
+            f"{USER_AXISYM_SURFACE_VOLUME_CORRECTION_MAX_RADIAL_STEP_UM:.3f} um"
         )
     print(
         "Fp,proj trial refinement  = "
@@ -7625,6 +7926,14 @@ def run_motion_case(
                     f"{record_row['position_volume_constraint_status']}, "
                     f"rel {float(record_row['position_volume_constraint_rel_before']):+.6e}"
                     f" -> {float(record_row['position_volume_constraint_rel_after']):+.6e}",
+                    flush=True,
+                )
+                print(
+                    "Surface volume fix       = "
+                    f"{record_row['axisym_surface_volume_correction_status']}, "
+                    f"alpha {1.0e6 * float(record_row['axisym_surface_volume_correction_alpha_m']):+.6e} um, "
+                    f"rel {float(record_row['axisym_surface_volume_correction_rel_before']):+.6e}"
+                    f" -> {float(record_row['axisym_surface_volume_correction_rel_after']):+.6e}",
                     flush=True,
                 )
                 if bool(getattr(state.config, "enable_incompressible_projection", False)):

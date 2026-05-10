@@ -271,6 +271,7 @@ USER_CONTACT_LINE_CONTINUATION_WEIGHT = 0.02
 USER_CONTACT_LINE_FIT_RINGS = 4
 USER_CONTACT_LINE_COX_MACRO_LENGTH_M = 1.0e-3
 USER_CONTACT_LINE_COX_SLIP_LENGTH_M = 2.0e-9
+USER_USE_COX_CONTACT_LINE_FORCE = True
 # The run loops honor this value now. Keep the default serial because this
 # operator is Python/object-graph heavy; 8 ThreadPool workers tested slower on
 # the current axisymmetric force-cache path. Raise manually after benchmarking.
@@ -383,6 +384,7 @@ class VolumetricPitoisConfig:
     contact_line_fit_rings: int = USER_CONTACT_LINE_FIT_RINGS
     contact_line_cox_macro_length_m: float = USER_CONTACT_LINE_COX_MACRO_LENGTH_M
     contact_line_cox_slip_length_m: float = USER_CONTACT_LINE_COX_SLIP_LENGTH_M
+    use_cox_contact_line_force: bool = USER_USE_COX_CONTACT_LINE_FORCE
     accel_workers: int = USER_ACCEL_WORKERS
     enforce_no_swirl: bool = USER_ENFORCE_NO_SWIRL
     # Literature-informed baseline for silicone oil on clean oxide-like solids
@@ -1963,9 +1965,72 @@ def _ring_segment_length_map(ring: list) -> dict[int, float]:
     return seg_map
 
 
+def _cox_contact_line_signed_speed(state: VolumetricPitoisState, *, which: str) -> float:
+    if which == "top":
+        ring = state.top_contact_ring
+    else:
+        ring = state.bottom_contact_ring
+    if not ring:
+        return 0.0
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    sphere_center = top_center if which == "top" else bottom_center
+    return float(
+        _contact_line_ring_speed(
+            state,
+            ring=ring,
+            sphere_center=sphere_center,
+            axis=axis,
+            which=which,
+        )
+    )
+
+
+def _cox_uy_contact_line_liquid_force_map(state: VolumetricPitoisState) -> dict[int, np.ndarray]:
+    cached = getattr(state, "_cox_uy_contact_line_force_cache", None)
+    if cached is not None:
+        return cached
+
+    force_map: dict[int, np.ndarray] = {}
+    bottom_center, top_center, axis = _particle_centers_physical(state)
+    theta_eq = float(np.deg2rad(state.config.contact_angle_deg))
+    gamma = float(state.config.gamma)
+
+    for which, ring, sphere_center in (
+        ("bottom", state.bottom_contact_ring, bottom_center),
+        ("top", state.top_contact_ring, top_center),
+    ):
+        if not ring:
+            continue
+        speed = _cox_contact_line_signed_speed(state, which=which)
+        theta_dyn = _dynamic_contact_angle_from_speed(state, slide_speed=speed)
+        young_coeff = gamma * (float(np.cos(theta_dyn)) - float(np.cos(theta_eq)))
+        seg_map = _ring_segment_length_map(ring)
+        for v in ring:
+            point = np.asarray(v.x_a[:3], dtype=float)
+            slide_dir = _contact_line_slide_direction(
+                point,
+                sphere_center=np.asarray(sphere_center, dtype=float),
+                axis=axis,
+                which=which,
+            )
+            if float(np.linalg.norm(slide_dir)) <= 1.0e-30:
+                continue
+            ell_i = max(float(seg_map.get(id(v), 0.0)), 0.0)
+            force = young_coeff * ell_i * slide_dir
+            if np.all(np.isfinite(force)):
+                force_map[id(v)] = force_map.get(id(v), np.zeros(3, dtype=float)) + force
+
+    state._cox_uy_contact_line_force_cache = force_map
+    return force_map
+
+
 def _Fcl(v, *, state: VolumetricPitoisState) -> np.ndarray:
-    # Surface tension in this case is supplied only by the validated Heron
-    # operator path, via _surface_tension_force_heron().
+    if bool(getattr(state, "gmsh_compute_mesh", False)) and bool(
+        getattr(state.config, "use_cox_contact_line_force", USER_USE_COX_CONTACT_LINE_FORCE)
+    ):
+        force = _cox_uy_contact_line_liquid_force_map(state).get(id(v))
+        if force is not None:
+            return np.asarray(force[:3], dtype=float)
     return np.zeros(3, dtype=float)
 
 
@@ -3308,6 +3373,7 @@ def _axisym_clear_caches(state: VolumetricPitoisState) -> None:
         "_gmsh_axisym_force_cache",
         "_gmsh_axisym_accel_cache",
         "_gmsh_surface_heron_force_cache",
+        "_cox_uy_contact_line_force_cache",
     ):
         if hasattr(state, attr):
             delattr(state, attr)
