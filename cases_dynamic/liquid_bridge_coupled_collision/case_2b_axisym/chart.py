@@ -17,6 +17,12 @@ from matplotlib.ticker import FuncFormatter, NullFormatter
 
 NEATPLOT_STYLE = SCRIPT_DIR / "neatplot-main" / "standard.mplstyle"
 OUTPUT_PATH = SCRIPT_DIR / "chart.png"
+TIME_OUTPUT_PATH = SCRIPT_DIR / "chart_vs_t.png"
+
+# Pitois et al. (2000), Fig. 5: ruby spheres with R = 4 mm separating at
+# constant gap rate v = dD/dt = 5 um/s.
+PITOIS_RADIUS_MM = 4.0
+PITOIS_FIG5_GAP_RATE_MM_S = 5.0e-3
 
 
 EXP_D_OVER_R = np.array(
@@ -206,6 +212,21 @@ SIM_FORCE_MN = np.array(
 )
 
 
+def elapsed_time_from_d_over_r(d_over_r: np.ndarray) -> np.ndarray:
+    d_over_r = np.asarray(d_over_r, dtype=float)
+    return PITOIS_RADIUS_MM * (d_over_r - float(d_over_r[0])) / PITOIS_FIG5_GAP_RATE_MM_S
+
+
+def _format_log_axes(ax) -> None:
+    decimal_log_formatter = FuncFormatter(
+        lambda value, _pos: f"{float(value):g}" if value > 0.0 else ""
+    )
+    ax.xaxis.set_major_formatter(decimal_log_formatter)
+    ax.yaxis.set_major_formatter(decimal_log_formatter)
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+
 def main() -> None:
     plt.style.use(str(NEATPLOT_STYLE))
 
@@ -237,17 +258,44 @@ def main() -> None:
     ax.grid(True, which="both", alpha=0.28)
     ax.legend()
 
-    decimal_log_formatter = FuncFormatter(
-        lambda value, _pos: f"{float(value):g}" if value > 0.0 else ""
-    )
-    ax.xaxis.set_major_formatter(decimal_log_formatter)
-    ax.yaxis.set_major_formatter(decimal_log_formatter)
-    ax.xaxis.set_minor_formatter(NullFormatter())
-    ax.yaxis.set_minor_formatter(NullFormatter())
+    _format_log_axes(ax)
 
     fig.savefig(OUTPUT_PATH, bbox_inches="tight")
     plt.close(fig)
     print(OUTPUT_PATH)
+
+    exp_t_s = elapsed_time_from_d_over_r(EXP_D_OVER_R)
+    sim_t_s = elapsed_time_from_d_over_r(SIM_D_OVER_R)
+
+    fig, ax = plt.subplots()
+    ax.scatter(
+        exp_t_s,
+        EXP_FORCE_MN,
+        s=16,
+        color="#111111",
+        label="Pitois et al. (2000)",
+        zorder=3,
+    )
+    ax.plot(
+        sim_t_s,
+        SIM_FORCE_MN,
+        color="#d62828",
+        linewidth=1.4,
+        label="Axisymmetric simulation",
+        zorder=5,
+    )
+
+    ax.set_xlim(left=0.0)
+    ax.set_ylim(0.0, 1.7)
+    ax.set_xlabel(r"$t$ [s]")
+    ax.set_ylabel(r"$|F|$ [mN]")
+    ax.set_title("Pitois 2000 Fig. 5: reconstructed time comparison, linear scale")
+    ax.grid(True, which="major", alpha=0.28)
+    ax.legend()
+
+    fig.savefig(TIME_OUTPUT_PATH, bbox_inches="tight")
+    plt.close(fig)
+    print(TIME_OUTPUT_PATH)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ USER_INTERACTIVE_ELEV_DEG = 7#15.0 #0# # side-on reference: 0
 USER_INTERACTIVE_AZIM_DEG = 45.0  #90# # side-on reference: -87
 USER_LIQUID_BRIDGE_ALPHA = 1
 USER_SPHERE_ALPHA = 1
-USER_SPHERE_VISIBLE_FRACTION = 1.0 / 9 #0.028#
+USER_SPHERE_VISIBLE_FRACTION = 1.0 / 10 #0.028#
 USER_VERTEX_SIZE = 0.0
 USER_X_LIMITS_MM = (-3.0, 3.0)
 USER_Y_LIMITS_MM = (-3.0, 3.0)
@@ -39,7 +39,6 @@ USER_USE_DEFINED_SPHERE_MOTION = True
 USER_SPHERE_MOTION_DT_S = 0.01
 USER_SPHERE_MOTION_SPEED_MPS = 5.0e-6
 USER_SPHERE_MOTION_DIRECTION = (0.0, 0.0, -1.0)
-USER_SPHERE_PATCH_MODE = "fixed"  # "fixed" keeps the visible sphere patch locked to the sphere.
 USER_KEEP_INTERACTIVE_WINDOWS = True
 # Number of figures to keep open after PNG export. Use -1 to keep every figure.
 USER_INTERACTIVE_WINDOW_LIMIT = 1
@@ -52,7 +51,8 @@ DEFAULT_PARTICLE_RADIUS_M = 4.0e-3
 LIQUID_FACE_COLOR = "#8fb0c5"
 LIQUID_EDGE_COLOR = "#637988"
 SPHERE_FACE_COLOR = "#c8c6bc"
-
+LIQUID_FACE_COLOR = "#acd2e9"
+LIQUID_EDGE_COLOR = "#5C748B"
 
 def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -118,12 +118,6 @@ def _build_cli() -> argparse.ArgumentParser:
         type=float,
         default=USER_SPHERE_MOTION_SPEED_MPS,
         help="Moving sphere speed used by the prescribed sphere motion.",
-    )
-    parser.add_argument(
-        "--sphere-patch-mode",
-        choices=("fixed", "contact"),
-        default=USER_SPHERE_PATCH_MODE,
-        help="Use a fixed visible sphere patch, or let the patch follow the current contact line.",
     )
     parser.add_argument(
         "--vertex-size",
@@ -587,8 +581,6 @@ def _plot_surface(
     z_limits_mm: tuple[float, float] | list[float] | None,
     clip_to_axis_limits: bool,
     sphere_centers: tuple[np.ndarray, np.ndarray] | None,
-    sphere_reference_contact_offsets: tuple[float, float] | None,
-    sphere_patch_mode: str,
 ):
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
@@ -629,16 +621,10 @@ def _plot_surface(
             (bottom_center, bottom_contact_z),
             (top_center, top_contact_z),
         )
-        if sphere_patch_mode == "fixed" and sphere_reference_contact_offsets is not None:
-            sphere_specs = (
-                (bottom_center, float(bottom_center[2]) + float(sphere_reference_contact_offsets[0])),
-                (top_center, float(top_center[2]) + float(sphere_reference_contact_offsets[1])),
-            )
-
-        for center, patch_contact_z in sphere_specs:
+        for center, contact_z in sphere_specs:
             phi_min, phi_max = _sphere_cap_phi_limits(
                 center,
-                patch_contact_z,
+                contact_z,
                 float(sphere_radius_m),
                 sphere_visible_fraction,
             )
@@ -797,35 +783,17 @@ def _read_reference_sphere_centers(
     *,
     sphere_radius_m: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    centers, _contact_offsets = _read_reference_sphere_state(
-        msh_file,
-        sphere_radius_m=sphere_radius_m,
-    )
-    return centers
-
-
-def _read_reference_sphere_state(
-    msh_file: Path,
-    *,
-    sphere_radius_m: float,
-) -> tuple[tuple[np.ndarray, np.ndarray], tuple[float, float]]:
     mesh = meshio.read(msh_file)
     points = np.asarray(mesh.points, dtype=float)
     tets = _tetra_blocks(mesh)
     boundary_faces = _boundary_faces_from_tets(tets)
     surface_faces = _outer_liquid_surface_faces(points, boundary_faces)
-    bottom_center, top_center, _contact_radius, bottom_contact_z, top_contact_z = _sphere_geometry_from_bridge(
+    bottom_center, top_center, _contact_radius, _bottom_contact_z, _top_contact_z = _sphere_geometry_from_bridge(
         points,
         surface_faces,
         sphere_radius_m=float(sphere_radius_m),
     )
-    return (
-        (bottom_center, top_center),
-        (
-            float(bottom_contact_z) - float(bottom_center[2]),
-            float(top_contact_z) - float(top_center[2]),
-        ),
-    )
+    return bottom_center, top_center
 
 
 def _render_mesh_png(
@@ -834,7 +802,6 @@ def _render_mesh_png(
     png_file: Path,
     *,
     sphere_reference_centers: tuple[np.ndarray, np.ndarray] | None,
-    sphere_reference_contact_offsets: tuple[float, float] | None,
     keep_figure: bool,
 ):
     import matplotlib.pyplot as plt
@@ -884,8 +851,6 @@ def _render_mesh_png(
         z_limits_mm=args.z_limits,
         clip_to_axis_limits=bool(USER_CLIP_TO_AXIS_LIMITS) and not bool(args.no_axis_clip),
         sphere_centers=sphere_centers,
-        sphere_reference_contact_offsets=sphere_reference_contact_offsets,
-        sphere_patch_mode=str(args.sphere_patch_mode),
     )
     png_file.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(png_file, dpi=180, bbox_inches="tight")
@@ -911,12 +876,11 @@ def main() -> None:
         raise FileNotFoundError(f"No .msh files matched {args.pattern!r} in {input_dir}")
 
     sphere_reference_centers = None
-    sphere_reference_contact_offsets = None
     if args.sphere_motion == "defined":
         reference_msh = input_dir / "mesh_iter0000.msh"
         if not reference_msh.is_file():
             reference_msh = next((path for path in msh_files if _mesh_iteration_number(path) == 0), msh_files[0])
-        sphere_reference_centers, sphere_reference_contact_offsets = _read_reference_sphere_state(
+        sphere_reference_centers = _read_reference_sphere_centers(
             reference_msh,
             sphere_radius_m=float(args.sphere_radius_mm) * 1.0e-3,
         )
@@ -948,7 +912,6 @@ def main() -> None:
             msh_file,
             png_file,
             sphere_reference_centers=sphere_reference_centers,
-            sphere_reference_contact_offsets=sphere_reference_contact_offsets,
             keep_figure=keep_figure,
         )
         if fig is not None:
